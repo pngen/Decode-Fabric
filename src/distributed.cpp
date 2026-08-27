@@ -228,6 +228,16 @@ Result<void> run_coordinator(DecodeFabric& fab, int listen_port, int max_loops, 
                 }
                 break;
               }
+              case FrameType::ExplainRequest: {
+                auto eq = decode_explain_request(f.payload);
+                ExplainReply erp;
+                if (eq.ok()) {
+                  Explain ex = fab.explain(eq.value().sequence, eq.value().question);
+                  erp.text = ex.answer; erp.json = ex.to_json();
+                } else { erp.text = "bad explain request"; erp.json = "{}"; }
+                (void)sp->send_frame(FrameType::ExplainReply, encode_explain_reply(erp));
+                break;
+              }
               case FrameType::RollEpoch: {
                 (void)fab.roll_epoch();
                 Snapshot sn3 = fab.snapshot();

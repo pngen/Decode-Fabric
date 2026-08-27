@@ -1056,13 +1056,24 @@ Result<std::vector<std::uint8_t>> DecodeFabric::serialize_state() const {
   std::uint32_t crc = Crc32::update(0xFFFFFFFFu, body.data(), body.size());
   crc = ~crc;
   binary::Writer out;
-  out.bytes(body);
+  out.bytes(body.data(), body.size());
   out.u32(crc);
   return Result<std::vector<std::uint8_t>>::ok(out.take());
 }
 
 Result<void> DecodeFabric::recover_state(const std::vector<std::uint8_t>& bytes) {
   std::unique_lock lk(impl_->mtx);
+  // Verify the trailing 32-bit CRC over the body before mutating anything.
+  if (bytes.size() < 5)
+    return failed<void>(ErrorCode::PersistenceTruncated, "state too short");
+  std::uint32_t expected_crc = static_cast<std::uint32_t>(bytes[bytes.size() - 4]) |
+                              (static_cast<std::uint32_t>(bytes[bytes.size() - 3]) << 8) |
+                              (static_cast<std::uint32_t>(bytes[bytes.size() - 2]) << 16) |
+                              (static_cast<std::uint32_t>(bytes[bytes.size() - 1]) << 24);
+  std::uint32_t computed = Crc32::update(0xFFFFFFFFu, bytes.data(), bytes.size() - 4);
+  computed = ~computed;
+  if (computed != expected_crc)
+    return failed<void>(ErrorCode::PersistenceChecksumMismatch, "state checksum mismatch");
   binary::Reader r(bytes);
   auto m0 = r.u8(); if (!m0.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "missing magic");
   auto m1 = r.u8(); if (!m1.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "missing magic");
@@ -1157,8 +1168,16 @@ Result<void> DecodeFabric::recover_state(const std::vector<std::uint8_t>& bytes)
     auto tst = r.u8(); if (!tst.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "t state");
     impl_->terminal_records[SequenceId::from(tseq.value())] = static_cast<SequenceState>(tst.value());
   }
-  // Verify checksum (last 4 bytes).
-  auto crc_read = r.u32();
+  // Recompute derived/total counters from the restored sequences (the raw
+  // aggregate counters are derived, never trusted from the wire).
+  impl_->stats.generated_tokens = 0;
+  impl_->stats.decode_steps = 0;
+  impl_->stats.sequences_started = static_cast<std::uint64_t>(impl_->seqs.size());
+  impl_->stats.requests_admitted = static_cast<std::uint64_t>(impl_->req_to_seq.size());
+  for (const auto& kv : impl_->seqs) {
+    impl_->stats.generated_tokens += kv.second.generated;
+    if (kv.second.generation >= 1) impl_->stats.decode_steps += (kv.second.generation - 1);
+  }
   impl_->record_event(EventKind::MemoryReconciled, {}, {}, "recovered");
   return Result<void>::success();
 }

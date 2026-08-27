@@ -60,6 +60,20 @@ struct QueryRequest {
 std::vector<std::uint8_t> encode_query(const QueryRequest& q);
 Result<QueryRequest> decode_query(const std::vector<std::uint8_t>& bytes);
 
+// --- Explain query (coordinator -> client) ----------------------------------
+struct ExplainRequest {
+  SequenceId sequence;
+  std::string question;
+};
+struct ExplainReply {
+  std::string text;
+  std::string json;
+};
+std::vector<std::uint8_t> encode_explain_request(const ExplainRequest& q);
+Result<ExplainRequest> decode_explain_request(const std::vector<std::uint8_t>& bytes);
+std::vector<std::uint8_t> encode_explain_reply(const ExplainReply& r);
+Result<ExplainReply> decode_explain_reply(const std::vector<std::uint8_t>& bytes);
+
 // --- Authority query (coordinator -> client) ---------------------------------
 // Returns the in-flight dispatch authority for a sequence so a driver can
 // preserve a genuine pre-restart artifact for stale replay.

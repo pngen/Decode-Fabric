@@ -50,7 +50,7 @@ Result<bool> FrameDecoder::try_emit(Frame& out) {
                        (static_cast<std::uint32_t>(buf_[11]) << 24);
   // Validate message type is a known value.
   bool known = false;
-  for (std::uint32_t t = 1; t <= 43; ++t) {
+  for (std::uint32_t t = 1; t <= 45; ++t) {
     if (t == type) { known = true; break; }
   }
   if (!known) {
@@ -381,6 +381,26 @@ Result<QueryRequest> decode_query(const std::vector<std::uint8_t>& bytes) {
   auto c = r.u8(); if (!c.ok()) return Result<QueryRequest>{c.error()};
   q.request = RequestId::from(a.value()); q.sequence = SequenceId::from(b.value()); q.want_snapshot = c.value() != 0;
   return Result<QueryRequest>::ok(q);
+}
+std::vector<std::uint8_t> encode_explain_request(const ExplainRequest& q) {
+  Writer w; w.u64(q.sequence.value()); w.str(q.question); return w.take();
+}
+Result<ExplainRequest> decode_explain_request(const std::vector<std::uint8_t>& bytes) {
+  Reader r(bytes); ExplainRequest q;
+  auto a = r.u64(); if (!a.ok()) return Result<ExplainRequest>{a.error()};
+  auto b = r.str(); if (!b.ok()) return Result<ExplainRequest>{b.error()};
+  q.sequence = SequenceId::from(a.value()); q.question = b.value();
+  return Result<ExplainRequest>::ok(q);
+}
+std::vector<std::uint8_t> encode_explain_reply(const ExplainReply& q) {
+  Writer w; w.str(q.text); w.str(q.json); return w.take();
+}
+Result<ExplainReply> decode_explain_reply(const std::vector<std::uint8_t>& bytes) {
+  Reader r(bytes); ExplainReply q;
+  auto a = r.str(); if (!a.ok()) return Result<ExplainReply>{a.error()};
+  auto b = r.str(); if (!b.ok()) return Result<ExplainReply>{b.error()};
+  q.text = a.value(); q.json = b.value();
+  return Result<ExplainReply>::ok(q);
 }
 std::vector<std::uint8_t> encode_get_authority(const GetAuthority& g) {
   Writer w; w.u64(g.sequence.value()); return w.take();
