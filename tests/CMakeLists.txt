@@ -24,6 +24,11 @@ target_link_libraries(persistence_test PRIVATE decodefabric)
 target_include_directories(persistence_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 add_test(NAME unit_persistence COMMAND persistence_test)
 
+add_executable(robustness_test test_main.cpp robustness_test.cpp)
+target_link_libraries(robustness_test PRIVATE decodefabric)
+target_include_directories(robustness_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME unit_robustness COMMAND robustness_test)
+
 add_executable(distributed_smoke test_main.cpp distributed_smoke.cpp)
 target_link_libraries(distributed_smoke PRIVATE decodefabric)
 target_include_directories(distributed_smoke PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
