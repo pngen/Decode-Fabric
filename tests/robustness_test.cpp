@@ -30,7 +30,7 @@ DF_TEST(concurrency_submission_snapshot_completion) {
   for (int t = 0; t < threads; ++t) {
     ts.emplace_back([&, t]() {
       for (int i = 0; i < per_thread; ++i) {
-        std::uint64_t seq = 10000 * t + i;
+        std::uint64_t seq = 10000 * (t + 1) + i;
         AdmissionDecision d = fab.submit(req(seq, seq, (t % 3) + 1, 5));
         if (!d.admitted) std::fprintf(stderr, "REJECT seq=%llu reason=%s\n", (unsigned long long)seq, d.reason.c_str());
       }
@@ -40,8 +40,9 @@ DF_TEST(concurrency_submission_snapshot_completion) {
   (void)fab.pump_until_idle(ex, TimePoint(0), 2000);
   Stats st = fab.stats();
   std::printf("CONCURRENCY gen=%llu started=%llu admitted=%llu active=%u\n", (unsigned long long)st.generated_tokens, (unsigned long long)st.sequences_started, (unsigned long long)st.requests_admitted, fab.active_sequences());
-  // Every admitted sequence must have generated exactly its budget and completed.
-  CHECK(st.generated_tokens == st.sequences_started * 5ull);
+  // Every submitted sequence must have been admitted and generated exactly its budget.
+  CHECK(st.sequences_started == threads * per_thread);
+  CHECK(st.generated_tokens == threads * per_thread * 5ull);
   CHECK(fab.active_sequences() == 0);
   // Concurrent read APIs must be safe.
   std::vector<std::thread> readers;
