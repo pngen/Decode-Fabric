@@ -1,5 +1,6 @@
 #include "decodefabric/fabric.hpp"
 #include "decodefabric/cpu_executor.hpp"
+#include "decodefabric/cuda_executor.hpp"
 #include "decodefabric/binary.hpp"
 #include "decodefabric/messages.hpp"
 #include "decodefabric/protocol.hpp"
@@ -308,12 +309,13 @@ int coordinator_main(int argc, char** argv) {
 // Worker
 // ===========================================================================
 int worker_main(int argc, char** argv) {
-  if (argc < 6) { std::fprintf(stderr, "usage: df-worker <host> <port> <worker_id> <boot_id> <device_id>\n"); return 2; }
+  if (argc < 6) { std::fprintf(stderr, "usage: df-worker <host> <port> <worker_id> <boot_id> <device_id> [--cuda]\n"); return 2; }
   std::string host = argv[1];
   int port = std::atoi(argv[2]);
   WorkerId wid = WorkerId::from(std::strtoull(argv[3], nullptr, 10));
   WorkerBootId boot = WorkerBootId::from(std::strtoull(argv[4], nullptr, 10));
   DeviceId dev = DeviceId::from(std::strtoull(argv[5], nullptr, 10));
+  bool want_cuda = (argc >= 6 && std::string(argv[argc - 1]) == "--cuda");
 
   TcpConnection conn;
   // Retry connect: the coordinator may still be binding when the worker is
@@ -325,11 +327,23 @@ int worker_main(int argc, char** argv) {
   }
   if (!cr.ok()) { std::fprintf(stderr, "worker connect failed: %s\n", cr.error().message.c_str()); return 1; }
 
-  CpuDecodeExecutor ex(dev);
+  BackendKind kb = BackendKind::CPU;
+  std::unique_ptr<DecodeExecutor> ex;
+  if (want_cuda) {
+#ifdef DECODEFABRIC_CUDA_ENABLED
+    ex = std::make_unique<CudaDecodeExecutor>(dev, 0);
+    kb = BackendKind::CUDA;
+#else
+    std::fprintf(stderr, "worker: CUDA not enabled in this build; using CPU\n");
+    ex = std::make_unique<CpuDecodeExecutor>(dev);
+#endif
+  } else {
+    ex = std::make_unique<CpuDecodeExecutor>(dev);
+  }
   WorkerDescriptor w;
   w.id = wid; w.boot_id = boot; w.health = WorkerHealth::Healthy;
-  w.device = ex.device(); w.advertised_capacity = 256;
-  w.supported_models.push_back(make_supported_key(dev, BackendKind::CPU));
+  w.device = ex->device(); w.advertised_capacity = 256;
+  w.supported_models.push_back(make_supported_key(dev, kb));
   (void)conn.send_frame(FrameType::Hello, enc_worker(w));
 
   while (true) {
@@ -339,7 +353,7 @@ int worker_main(int argc, char** argv) {
     if (fr.type == FrameType::ExecuteRequest) {
       auto req = decode_execute_request(fr.payload);
       if (!req.ok()) { continue; }
-      auto res = ex.execute(req.value());
+      auto res = ex->execute(req.value());
       if (res.ok()) {
         (void)conn.send_frame(FrameType::ExecuteResult, encode_execute_result(res.value()));
       } else {

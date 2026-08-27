@@ -88,7 +88,7 @@ runs, and exercises real public API behavior.
 ## CLI
 
 - serve <port> [loops] - run an in-process coordinator.
-- worker <host> <port> <id> <boot_id> <device_id> - run a worker process.
+- worker <host> <port> <id> <boot_id> <device_id> - run a worker process (append --cuda for the CUDA decoder).
 - submit <host> <port> <seq> <tenant> <budget> [--model N] [--rev N]
 - status / stats / snapshot - query a running coordinator.
 - explain <host> <port> <seq> <question> - structured why-answer.

@@ -89,6 +89,7 @@ if(MSVC)
   target_link_libraries(decodefabric PRIVATE ws2_32)
   if(DF_CUDA_FOUND)
     target_link_libraries(decodefabric PUBLIC CUDA::cudart)
+    target_compile_definitions(decodefabric PUBLIC DECODEFABRIC_CUDA_ENABLED)
   endif()
 endif()
 
