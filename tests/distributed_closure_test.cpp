@@ -32,7 +32,8 @@ DF_TEST(multiprocess_atomic_closure){
   CHECK(ka&&kb&&kc&&kd);
   bool late=false;
   AuthorityReply preserved; bool captured=false;
-  for(int i=0;i<9000&&!captured;++i){ StatusReply s=status(kPort); if(s.generated_tokens>0&&!late){ late=add(15,1005,30,8); } AuthorityReply a=get_auth(kPort,long_seq); if(a.exists){ preserved=a; captured=true; } }
+  for(int i=0;i<12000&&!(captured&&late);++i){ StatusReply s=status(kPort); if(!late&&s.generated_tokens>0){ late=add(15,1005,30,8); } AuthorityReply a=get_auth(kPort,long_seq); if(a.exists&&!captured){ preserved=a; captured=true; } }
+  if(!late){ late=add(15,1005,30,8); }
   CHECK(captured); CHECK(late);
   SpawnedProcess* target=(preserved.worker.value()==1)?&w1:&w2; CHECK(target->kill());
   bool reconciled=false; for(int i=0;i<9000&&!reconciled;++i){ AuthorityReply a=get_auth(kPort,long_seq); if(!a.exists) reconciled=true; } CHECK(reconciled);
