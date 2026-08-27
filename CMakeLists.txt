@@ -7,7 +7,6 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 # Statically-linked runtime so downstreams do not need a matching dynamic CRT.
 if(MSVC)
-  set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
   add_compile_definitions(_CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN)
   add_compile_definitions(_WINSOCK_DEPRECATED_NO_WARNINGS)
 endif()
@@ -79,6 +78,7 @@ endif()
 
 add_library(decodefabric STATIC ${DF_SOURCES})
 add_library(DecodeFabric::DecodeFabric ALIAS decodefabric)
+set_target_properties(decodefabric PROPERTIES EXPORT_NAME DecodeFabric)
 
 target_include_directories(decodefabric PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
