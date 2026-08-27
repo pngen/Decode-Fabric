@@ -2,9 +2,13 @@
 /build/
 /build-release/
 /build-debug/
+/build-cuda/
+/build-prefix/
+/ext-build/
 /cmake-build-*/
 /out/
 /_build/
+/example_state_dir/
 
 # CMake
 CMakeCache.txt
