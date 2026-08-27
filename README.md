@@ -105,15 +105,6 @@ tenant fairness, latency-sensitive decode, cancellation between steps, retry
 after member failure, persistence/recovery after partial generation, CUDA decode,
 and distributed coordinator/workers.
 
-## License & contribution
+## License
 
-Decode Fabric is licensed under the Apache License 2.0 (see LICENSE). See NOTICE
-and CONTRIBUTING.md. Contributions are accepted without a CLA.
-
-## Proven limitations
-
-See docs/limitations.md. Notable: cancellation is authoritative at the decode
-step boundary, not arbitrarily mid-kernel; externally managed KV payloads are
-opaque to Decode Fabric; the single verified CUDA device is the RTX 5090
-(sm_120); the distributed proof uses single-host/loopback; and there is no
-built-in full-model sampling/tokenization (intentionally out of scope).
+Apache License 2.0. Copyright 2026 Summon Software Labs. No telemetry transmission.
