@@ -1,0 +1,51 @@
+# Build trees
+/build/
+/build-release/
+/build-debug/
+/cmake-build-*/
+/out/
+/_build/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+Makefile
+*.ninja
+.ninja_deps
+.ninja_log
+compile_commands.json
+
+# IDE / editor
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.sln
+*.vcxproj
+*.xcodeproj/
+
+# Temporary / generated traces
+*.tmp
+*.bak
+*.orig
+*.rej
+*.log
+*.spill
+/probes/
+.DS_Store
+Thumbs.db
+
+# Test junk
+/Testing/
+/TestResults/
+*.cov
+*.clang-format.saved
+
+# Secrets
+*.pem
+*.key
+*.crt
+.env

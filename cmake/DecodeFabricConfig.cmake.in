@@ -1,0 +1,15 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+include("${CMAKE_CURRENT_LIST_DIR}/DecodeFabricTargets.cmake")
+
+# If the library was built with CUDA, rebuild the external dependency.
+if(@DF_CUDA_FOUND@)
+  find_dependency(CUDAToolkit)
+endif()
+
+if(DecodeFabric_FOUND)
+  set(DecodeFabric_VERSION "@PROJECT_VERSION@")
+endif()
+
+check_required_components(DecodeFabric)
