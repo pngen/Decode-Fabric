@@ -208,6 +208,38 @@ struct MemberReceipt {
   TimePoint committed_at;                 // timestamp metadata
 };
 
+// The canonical accepted-generation record: the durable, idempotent receipt of
+// exactly one authorized state transition. When a generation is accepted (the
+// fabric finalized it), this record IS the receipt. It binds the full existing
+// authority tuple (CoordinatorEpoch, WorkerId, WorkerBootId, SequenceId,
+// StateId, AttemptId, DecodeGeneration, DispatchId) plus the committed-token
+// indices and the pre/post state digests, and carries a stable idempotency key.
+// A replayed/recovered acceptance of the SAME generation is reconciled exactly
+// once instead of minting or authorizing a second logical transition.
+// `promotion_observed` records whether the executor's committed-state promotion
+// was confirmed by a receipt at acceptance time; when false it represents the
+// recovery edge "Fabric accepted, executor promotion not yet observed", and
+// recovery reconciles that SAME generation exactly once rather than authorizing
+// a second one.
+struct AcceptedGeneration {
+  std::uint64_t idempotency_key = 0;   // stable hash over the authority identity
+  CoordinatorEpoch epoch;
+  WorkerId worker;
+  WorkerBootId worker_boot;
+  SequenceId sequence;
+  StateId state;
+  AttemptId attempt;
+  DecodeGeneration generation;
+  DispatchId dispatch;
+  std::uint64_t committed_position_before = 0;
+  std::uint64_t committed_position_after = 0;
+  std::uint64_t pre_state_digest = 0;
+  std::uint64_t post_state_digest = 0;
+  std::uint64_t delta_digest = 0;
+  bool terminal = false;
+  bool promotion_observed = false;
+};
+
 // A group-level decode result: per-member receipts for members that committed.
 struct ReceiptDecode {
   DispatchId dispatch_id;

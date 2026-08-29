@@ -160,6 +160,9 @@ class DecodeFabric {
   GrantId pending_grant(SequenceId seq) const;
   int grant_status(GrantId grant) const;
   std::uint64_t receipt_count() const;
+  // Durable accepted-generation record (the idempotent receipt) for a sequence.
+  bool has_accepted_generation(SequenceId seq) const;
+  AcceptedGeneration accepted_generation(SequenceId seq) const;
 
   // Synchronous convenience: one full pump (schedule -> execute -> complete).
   std::vector<Dispatch> pump_once(DecodeExecutor& executor, TimePoint now);

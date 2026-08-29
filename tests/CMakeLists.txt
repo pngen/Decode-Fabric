@@ -39,6 +39,11 @@ target_link_libraries(invariants_test PRIVATE decodefabric)
 target_include_directories(invariants_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 add_test(NAME unit_invariants COMMAND invariants_test)
 
+add_executable(recovery_idempotency_test test_main.cpp recovery_idempotency_test.cpp)
+target_link_libraries(recovery_idempotency_test PRIVATE decodefabric)
+target_include_directories(recovery_idempotency_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME unit_recovery_idempotency COMMAND recovery_idempotency_test)
+
 add_executable(distributed_smoke test_main.cpp distributed_smoke.cpp)
 target_link_libraries(distributed_smoke PRIVATE decodefabric)
 target_include_directories(distributed_smoke PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

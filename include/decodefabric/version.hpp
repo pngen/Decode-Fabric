@@ -14,6 +14,6 @@ inline constexpr char const* kVersionString = "1.0.0";
 // container. Kept independent from the library version so the wire and on-disk
 // formats have their own evolution policy.
 inline constexpr std::uint32_t kProtocolVersion = 1;
-inline constexpr std::uint32_t kPersistenceVersion = 2;
+inline constexpr std::uint32_t kPersistenceVersion = 3;
 
 }  // namespace decodefabric

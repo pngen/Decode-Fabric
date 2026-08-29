@@ -16,6 +16,47 @@
 namespace decodefabric {
 
 namespace {
+// Stable idempotency key for an accepted generation: a FNV-1a hash over the
+// full authority identity + committed-token position. Two acceptances of the
+// SAME logical generation collide; a different sequence/attempt/generation/
+// dispatch/epoch/worker-boot/position differ.
+// Core FNV-1a over the authority identity + committed-token position.
+inline std::uint64_t acceptance_key_fields(CoordinatorEpoch ep, WorkerId wk, WorkerBootId wb,
+                                           SequenceId seq, StateId st, AttemptId at,
+                                           DecodeGeneration gen, DispatchId disp,
+                                           std::uint64_t pos) noexcept {
+  std::uint64_t h = 1469598103934665603ull;
+  auto mix = [&h](std::uint64_t v) noexcept { h ^= v; h *= 1099511628211ull; };
+  mix(ep.value()); mix(wk.value()); mix(wb.value()); mix(seq.value()); mix(st.value());
+  mix(at.value()); mix(gen.value()); mix(disp.value()); mix(pos);
+  return h;
+}
+
+inline std::uint64_t acceptance_key(const MemberReceipt& r) noexcept {
+  return acceptance_key_fields(r.epoch, r.worker, r.worker_boot, r.sequence, r.state,
+                               r.attempt, r.generation, r.dispatch, r.committed_position_before);
+}
+
+inline std::uint64_t acceptance_key(const PreparedMember& pm) noexcept {
+  return acceptance_key_fields(pm.epoch, pm.worker, pm.worker_boot, pm.sequence, pm.state,
+                               pm.attempt, pm.generation, pm.dispatch, pm.committed_position_before);
+}
+
+// Build the canonical accepted-generation record from a validated receipt.
+inline AcceptedGeneration make_accepted(const MemberReceipt& r, bool promotion_observed) noexcept {
+  AcceptedGeneration a;
+  a.idempotency_key = acceptance_key(r);
+  a.epoch = r.epoch; a.worker = r.worker; a.worker_boot = r.worker_boot;
+  a.sequence = r.sequence; a.state = r.state; a.attempt = r.attempt;
+  a.generation = r.generation; a.dispatch = r.dispatch;
+  a.committed_position_before = r.committed_position_before;
+  a.committed_position_after = r.committed_position_after;
+  a.pre_state_digest = r.pre_state_digest; a.post_state_digest = r.post_state_digest;
+  a.delta_digest = r.delta_digest; a.terminal = r.terminal;
+  a.promotion_observed = promotion_observed;
+  return a;
+}
+
 inline bool receipts_match(const MemberReceipt& a, const MemberReceipt& b) noexcept {
   return a.receipt_id == b.receipt_id && a.grant_id == b.grant_id &&
          a.proposal == b.proposal && a.sequence == b.sequence &&
@@ -79,6 +120,11 @@ struct DecodeFabric::Impl {
     bool has_inflight_grant = false;
     ProposalId in_flight_proposal;
     std::uint64_t in_flight_position = 0;
+    // Canonical accepted-generation record: the durable, idempotent receipt of
+    // the most recently finalized generation. Recovery reconciles a replay of
+    // this exact generation rather than authorizing a second transition.
+    AcceptedGeneration accepted;
+    bool has_accepted = false;
     ReservationId reservation;
     StateDescriptor state;
     std::uint32_t attempt_count = 1;
@@ -965,6 +1011,20 @@ Result<DecodeFabric::AuthorizeResult> DecodeFabric::authorize_prepared(const Pre
     }
 
     // Commit-eligible: validate the transaction binding before issuing a grant.
+    // Idempotent replay reconciliation: if this exact generation was already
+    // accepted (its accepted-generation record is present and its idempotency
+    // key matches), reconcile the SAME generation rather than authorizing a
+    // second transition. We abort the prepared tentative and record the event;
+    // this is a replay, not a genuine stale completion, so it does not inflate
+    // the stale-rejection counter.
+    if (s.has_accepted && s.accepted.idempotency_key == acceptance_key(pm)) {
+      impl_->stale_reconcile(s, pm.sequence);
+      impl_->record_event(EventKind::StaleRejected, s.req.id, pm.sequence, "already_accepted_replay");
+      ga.rejected = true; ga.aborted = true; ga.error_code = ErrorCode::DuplicateCompletion;
+      ga.reason = "already-accepted generation reconciled idempotently";
+      ar.members.push_back(std::move(ga));
+      continue;
+    }
     if (s.has_inflight_grant) {
       impl_->stale_reconcile(s, pm.sequence);
       impl_->stats.stale_rejections++;
@@ -1043,6 +1103,15 @@ Result<void> DecodeFabric::apply_commit_receipt(const ReceiptDecode& receipts) {
     Impl::GrantRecord& gr = git->second;
     if (gr.status == 1) {  // already consumed
       if (gr.has_receipt && receipts_match(gr.receipt, rec)) continue;  // idempotent
+      // Idempotent replay reconciliation: if this exact accepted generation is
+      // already recorded (and matches), it is the SAME transition, not a second
+      // one. Return without re-finalizing or re-promoting.
+      auto s_it = impl_->seqs.find(rec.sequence);
+      if (s_it != impl_->seqs.end() && s_it->second.has_accepted &&
+          s_it->second.accepted.idempotency_key == acceptance_key(rec) &&
+          s_it->second.accepted.promotion_observed) {
+        continue;
+      }
       impl_->stats.stale_rejections++;
       impl_->record_event(EventKind::StaleRejected, {}, rec.sequence, "conflicting_duplicate_receipt");
       continue;
@@ -1106,6 +1175,11 @@ Result<void> DecodeFabric::apply_commit_receipt(const ReceiptDecode& receipts) {
     // expected committed pre-state.
     s.committed_state_digest = rec.post_state_digest;
     s.state_digest_established = true;
+
+    // The accepted-generation record IS the durable, idempotent receipt of this
+    // exact authorized transition (promotion was observed via the receipt).
+    s.accepted = make_accepted(rec, true);
+    s.has_accepted = true;
 
     bool terminal = rec.terminal || s.budget.exhausted();
     if (terminal) {
@@ -1192,6 +1266,18 @@ int DecodeFabric::grant_status(GrantId grant) const {
 std::uint64_t DecodeFabric::receipt_count() const {
   std::shared_lock lk(impl_->mtx);
   return impl_->receipt_count;
+}
+
+bool DecodeFabric::has_accepted_generation(SequenceId seq) const {
+  std::shared_lock lk(impl_->mtx);
+  auto it = impl_->seqs.find(seq);
+  return it != impl_->seqs.end() && it->second.has_accepted;
+}
+
+AcceptedGeneration DecodeFabric::accepted_generation(SequenceId seq) const {
+  std::shared_lock lk(impl_->mtx);
+  auto it = impl_->seqs.find(seq);
+  return it == impl_->seqs.end() ? AcceptedGeneration{} : it->second.accepted;
 }
 
 // ===========================================================================
@@ -1468,6 +1554,19 @@ Result<std::vector<std::uint8_t>> DecodeFabric::serialize_state() const {
     // Transactional executor-state protocol metadata.
     w.u64(s.committed_state_digest);
     w.u8(s.state_digest_established ? 1 : 0);
+    // Canonical accepted-generation record (the durable, idempotent receipt).
+    w.u8(s.has_accepted ? 1 : 0);
+    if (s.has_accepted) {
+      const AcceptedGeneration& a = s.accepted;
+      w.u64(a.idempotency_key);
+      w.u64(a.epoch.value()); w.u64(a.worker.value()); w.u64(a.worker_boot.value());
+      w.u64(a.sequence.value()); w.u64(a.state.value()); w.u64(a.attempt.value());
+      w.u64(a.generation.value()); w.u64(a.dispatch.value());
+      w.u64(a.committed_position_before); w.u64(a.committed_position_after);
+      w.u64(a.pre_state_digest); w.u64(a.post_state_digest); w.u64(a.delta_digest);
+      w.u8(a.terminal ? 1 : 0);
+      w.u8(a.promotion_observed ? 1 : 0);
+    }
   }
   // terminal records
   std::uint64_t tcount = static_cast<std::uint64_t>(impl_->terminal_records.size());
@@ -1601,6 +1700,36 @@ Result<void> DecodeFabric::recover_state(const std::vector<std::uint8_t>& bytes)
     auto sde = r.u8(); if (!sde.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "digest established");
     s.committed_state_digest = csd.value();
     s.state_digest_established = sde.value() != 0;
+    // Canonical accepted-generation record (durable, idempotent receipt).
+    auto hac = r.u8(); if (!hac.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "accepted flag");
+    s.has_accepted = hac.value() != 0;
+    if (s.has_accepted) {
+      AcceptedGeneration& a = s.accepted;
+      auto ik = r.u64(); if (!ik.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "accepted key");
+      auto ae = r.u64(); if (!ae.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "accepted epoch");
+      auto aw = r.u64(); if (!aw.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "accepted worker");
+      auto ab = r.u64(); if (!ab.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "accepted boot");
+      auto sq = r.u64(); if (!sq.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "accepted seq");
+      auto st2 = r.u64(); if (!st2.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "accepted state");
+      auto a_at = r.u64(); if (!a_at.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "accepted attempt");
+      auto gn = r.u64(); if (!gn.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "accepted gen");
+      auto di = r.u64(); if (!di.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "accepted dispatch");
+      auto cb = r.u64(); if (!cb.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "accepted cb");
+      auto ca = r.u64(); if (!ca.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "accepted ca");
+      auto pre = r.u64(); if (!pre.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "accepted pre");
+      auto post = r.u64(); if (!post.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "accepted post");
+      auto dd = r.u64(); if (!dd.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "accepted delta");
+      auto term = r.u8(); if (!term.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "accepted terminal");
+      auto po = r.u8(); if (!po.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "accepted promotion");
+      a.idempotency_key = ik.value();
+      a.epoch = CoordinatorEpoch::from(ae.value()); a.worker = WorkerId::from(aw.value());
+      a.worker_boot = WorkerBootId::from(ab.value()); a.sequence = SequenceId::from(sq.value());
+      a.state = StateId::from(st2.value()); a.attempt = AttemptId::from(a_at.value());
+      a.generation = DecodeGeneration::from(gn.value()); a.dispatch = DispatchId::from(di.value());
+      a.committed_position_before = cb.value(); a.committed_position_after = ca.value();
+      a.pre_state_digest = pre.value(); a.post_state_digest = post.value(); a.delta_digest = dd.value();
+      a.terminal = term.value() != 0; a.promotion_observed = po.value() != 0;
+    }
     // Never restore a stale in-flight authority as current.
     s.has_inflight = false;
     s.in_flight_dispatch = DispatchId::null();
