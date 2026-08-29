@@ -105,6 +105,18 @@ tenant fairness, latency-sensitive decode, cancellation between steps, retry
 after member failure, persistence/recovery after partial generation, CUDA decode,
 and distributed coordinator/workers.
 
+## External review and transactional authority hardening
+
+After the 1.0.0 release, Micah Zehnder identified an executor-resident state authority boundary in Decode Fabric: canonical Fabric state was protected from stale completions, but CPU/CUDA executor state could still advance before completion authority became final.
+
+That review led to a full transactional hardening pass across CPU, CUDA, Fabric authority, persistence, recovery, and the real distributed control path.
+
+Decode Fabric now uses prepare → authorize → commit semantics with tentative executor state, one-use authority, deterministic pre/post-state digests, and canonical accepted-generation records that serve as durable, idempotent receipts.
+
+If Fabric acceptance exists but executor promotion was not observed, recovery reconciles that same accepted generation exactly once rather than authorizing a second logical transition. Terminal generations are covered as well, and duplicate or replayed acceptance cannot produce a second promotion.
+
+External review credit: **Micah Zehnder** identified the authority boundary that motivated this hardening work.
+
 ## License
 
 Apache License 2.0. Copyright 2026 Summon Software Labs. No telemetry transmission.
