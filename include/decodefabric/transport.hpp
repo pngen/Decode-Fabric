@@ -1,5 +1,7 @@
 #pragma once
 #include <cstdint>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 #include "decodefabric/error.hpp"
@@ -37,6 +39,10 @@ class TcpConnection {
   std::vector<std::uint8_t> recv_buf_;
   protocol::FrameDecoder decoder_;
   int last_error_ = 0;
+  // Serializes sends on this connection. The coordinator's schedule thread may
+  // write a dispatch while a per-connection handler thread writes a commit
+  // grant; without this the two writes interleave and corrupt the frame stream.
+  mutable std::shared_ptr<std::mutex> send_mu_;
 };
 
 class TcpListener {

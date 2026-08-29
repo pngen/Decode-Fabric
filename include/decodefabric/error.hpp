@@ -26,6 +26,7 @@ enum class ErrorCode : std::uint32_t {
   DuplicateId = 14,
   DuplicateRequest = 15,
   UnknownSequence = 16,
+  UnknownState = 17,      // no known executor-resident state for this identity
 
   // Compatibility / grouping
   IncompatibleGroupMembers = 20,
@@ -62,6 +63,9 @@ enum class ErrorCode : std::uint32_t {
   CompletionForExpired = 67,
   CompletionForTerminal = 68,
   SupersededByRetry = 69,
+  StateDigestMismatch = 73,   // prepared/grant digest does not match the committed state
+  TransactionConflict = 74,   // conflicting prepared transition / grant for the same authority
+  GrantConsumed = 75,         // a one-use commit grant was already consumed
 
   // Retry
   RetryBudgetExhausted = 70,

@@ -132,6 +132,35 @@ class DecodeFabric {
   // advancing each sequence exactly once. Never advances stale/duplicate work.
   Result<void> apply_completion(const DecodeExecutionResult& result);
 
+  // Transactional executor-state protocol (prepare/authorize/commit/receipt).
+  struct GrantOrAbort {
+    bool has_grant = false;
+    CommitGrant grant;
+    bool has_abort = false;
+    AbortPrepared abort_spec;   // full authority tuple for the discard
+    ProposalId proposal;        // the prepared proposal this entry refers to
+    bool aborted = false;
+    bool rejected = false;
+    ErrorCode error_code = ErrorCode::Ok;
+    std::string reason;
+    MemberOutcome outcome;
+  };
+  struct AuthorizeResult {
+    DispatchId dispatch_id;
+    CoordinatorEpoch epoch;
+    WorkerId worker;
+    WorkerBootId worker_boot;
+    std::vector<GrantOrAbort> members;
+  };
+  Result<AuthorizeResult> authorize_prepared(const PreparedDecode& prepared);
+  Result<void> apply_commit_receipt(const ReceiptDecode& receipts);
+  Result<void> abort_prepared(const AbortPrepared& abort);
+  std::uint64_t sequence_committed_digest(SequenceId seq) const;
+  bool has_pending_grant(SequenceId seq) const;
+  GrantId pending_grant(SequenceId seq) const;
+  int grant_status(GrantId grant) const;
+  std::uint64_t receipt_count() const;
+
   // Synchronous convenience: one full pump (schedule -> execute -> complete).
   std::vector<Dispatch> pump_once(DecodeExecutor& executor, TimePoint now);
   // Run pumps until there is no runnable work (bounded by max_cycles; -1 = until idle).

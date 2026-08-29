@@ -42,12 +42,72 @@ rather than masked with timeouts.
    under limits, worker placement, memory reservation, and a Dispatch per group.
 3. The caller (or the coordinator) sends each Dispatch to a worker as a
    DecodeExecutionRequest over framed TCP.
-4. The worker executes one real decode iteration via its DecodeExecutor and
-   returns a DecodeExecutionResult with independent per-member outcomes.
-5. apply_completion(result): validates epoch/boot/attempt/generation/dispatch,
-   rejects stale/duplicate evidence without advancing, and advances each valid
-   continuing member exactly one generation (budget, timestamps, KV growth,
-   reservation reconciliation) while terminal members leave immediately.
+4. The worker prepares one real decode iteration via its DecodeExecutor and
+   returns a PreparedDecode (one PreparedMember per dispatched member).
+5. The fabric validates every authority token, then issues a one-use CommitGrant
+   per commit-eligible member (or requests an abort / applies a non-commit
+   outcome). No canonical generation advances here.
+6. The worker commits the authorized tentative transition and returns a
+   deterministic MemberReceipt.
+7. apply_commit_receipt() finalizes each sequence exactly one generation
+   (budget, timestamps, KV growth, reservation reconciliation) only after the
+   receipt is validated and its grant is consumed.
+
+## Transactional executor-state protocol
+
+The ordering **executor mutates -> fabric accepts** is deliberately NOT used.
+Instead the protocol is:
+
+    executor PREPARES tentative transition
+      -> Fabric VALIDATES authority + pre-state digest
+      -> Fabric issues one-use COMMIT GRANT
+      -> executor COMMIT promotes tentative -> committed (only on the grant)
+      -> executor returns a deterministic RECEIPT
+      -> Fabric FINALIZES canonical generation/token/budget/current_length
+
+The invariant the runtime enforces mechanically:
+
+> A Decode Fabric generation becomes authoritative only when the exact executor
+> transition prepared from the current committed pre-state is authorized under
+> current sequence/worker authority, committed exactly once, and bound by a
+> receipt whose post-state becomes the next generation's pre-state.
+
+### Executor state model
+
+Each executor holds, per StateId, a **committed** state and (while a transaction
+is in flight) a **tentative/prepared** state. A decode execution:
+
+1. reads ONLY the current committed state,
+2. computes the proposed next state into tentative storage,
+3. leaves the committed state unchanged,
+4. returns a prepared result describing the proposed transition,
+5. waits for explicit authorization before promoting tentative -> committed,
+6. discards tentative state on rejection/abort.
+
+The committed and tentative separation is real: for CPU it is two vectors; for
+CUDA it is a committed device buffer plus a separate tentative device buffer
+(the committed buffer stays byte-equivalent to its pre-step state until commit).
+
+### Prepared-transition identity
+
+Every prepared transition carries a unique, one-use **proposal id** and is bound
+to the complete authority identity: CoordinatorEpoch, WorkerId, WorkerBootId,
+SequenceId, StateId, AttemptId, DecodeGeneration, DispatchId, the authoritative
+committed-token position, and the pre/post state digests. A commit grant is bound
+to this same tuple plus its own one-use grant id, so a grant cannot be replayed
+for another sequence, worker boot, epoch, attempt, generation, dispatch, or a
+different prepared state.
+
+### State digests
+
+Deterministic state identity. CPU computes a digest over the committed recurrent
+state plus the state fields that define execution identity. CUDA computes the
+digest over the committed device buffer (bounded host copyback for hashing) plus
+the committed token/KV counters. The chain invariant is:
+
+    receipt(G).post_state_digest == prepare(G+1).pre_state_digest
+
+for consecutive accepted generations of the same sequence/attempt lineage.
 
 ## Continuous batching
 
@@ -60,7 +120,9 @@ GroupFormed/GroupGrew/GroupShrank events for observability.
 
 serialize_state() writes a versioned, checksummed snapshot of authoritative state
 (epoch, per-sequence metadata, generated count, next generation, budget, state
-identity/generation, terminal idempotency records). recover_state() verifies the
-magic, version, and CRC before mutating, rebuilds sequences, clears in-flight
-authority (stale authority is never restored as current), and recomputes derived
-counters from the restored sequences.
+identity/generation, terminal idempotency records, the committed pre-state digest
+per sequence, the grant ledger with consumed receipts, and the receipt chain).
+recover_state() verifies the magic, version, and CRC before mutating, rebuilds
+sequences, clears in-flight authority (stale authority is never restored as
+current), marks any pending grant as aborted, and recomputes derived counters
+from the restored sequences.

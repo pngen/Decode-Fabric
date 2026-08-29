@@ -2,6 +2,7 @@
 #include "decodefabric/fabric.hpp"
 #include "decodefabric/cpu_executor.hpp"
 #include "decodefabric/clock.hpp"
+#include "transactional_helpers.hpp"
 #include <cstdlib>
 #include <memory>
 #include <vector>
@@ -55,13 +56,7 @@ static std::vector<std::size_t> run_cycles(DecodeFabric& fab, CpuDecodeExecutor&
       continue;
     }
     for (Dispatch& d : ds) {
-      DecodeExecutionRequest req;
-      req.dispatch_id = d.id; req.epoch = d.epoch; req.worker = d.worker;
-      req.worker_boot = d.worker_boot; req.key = d.key; req.device = d.device;
-      req.reservation_id = d.reservation.value(); req.members = d.members;
-      { std::string k = d.key.to_string(); req.group_payload.assign(k.begin(), k.end()); }
-      auto rr = ex.execute(req);
-      if (rr.ok()) (void)fab.apply_completion(rr.value());
+      (void)df_test::drive_dispatch(fab, ex, d);
       sizes.push_back(d.members.size());
     }
   }
@@ -102,13 +97,7 @@ DF_TEST(continuous_batching_membership_changes) {
     std::vector<Dispatch> ds = fab.schedule(tn);
 
     for (Dispatch& d : ds) {
-      DecodeExecutionRequest req;
-      req.dispatch_id = d.id; req.epoch = d.epoch; req.worker = d.worker;
-      req.worker_boot = d.worker_boot; req.key = d.key; req.device = d.device;
-      req.reservation_id = d.reservation.value(); req.members = d.members;
-      { std::string k = d.key.to_string(); req.group_payload.assign(k.begin(), k.end()); }
-      auto rr = ex.execute(req);
-      if (rr.ok()) (void)fab.apply_completion(rr.value());
+      (void)df_test::drive_dispatch(fab, ex, d);
       sizes.push_back(d.members.size());
     }
     if (fab.active_sequences() == 0) break;
@@ -176,13 +165,7 @@ DF_TEST(cancellation_between_steps) {
   (void)fab.advance(tn);
   std::vector<Dispatch> ds = fab.schedule(tn);
   CHECK(ds.size() == 1);
-  DecodeExecutionRequest req; req.dispatch_id = ds[0].id; req.epoch = ds[0].epoch;
-  req.worker = ds[0].worker; req.worker_boot = ds[0].worker_boot; req.key = ds[0].key;
-  req.device = ds[0].device; req.reservation_id = ds[0].reservation.value(); req.members = ds[0].members;
-  { std::string k = ds[0].key.to_string(); req.group_payload.assign(k.begin(), k.end()); }
-  auto r = ex.execute(req);
-  CHECK(r.ok());
-  (void)fab.apply_completion(r.value());
+  (void)df_test::drive_dispatch(fab, ex, ds[0]);
   CHECK(fab.active_sequences() == 1);
   // Now cancel between steps (sequence is ReadyForNextToken).
   CancelResult c = fab.cancel(SequenceId::from(300));

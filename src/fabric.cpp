@@ -4,6 +4,7 @@
 #include "decodefabric/version.hpp"
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <shared_mutex>
@@ -12,6 +13,21 @@
 #include <unordered_set>
 
 namespace decodefabric {
+
+namespace {
+inline bool receipts_match(const MemberReceipt& a, const MemberReceipt& b) noexcept {
+  return a.receipt_id == b.receipt_id && a.grant_id == b.grant_id &&
+         a.proposal == b.proposal && a.sequence == b.sequence &&
+         a.state == b.state && a.attempt == b.attempt &&
+         a.generation == b.generation && a.worker == b.worker &&
+         a.worker_boot == b.worker_boot && a.epoch == b.epoch &&
+         a.dispatch == b.dispatch &&
+         a.committed_position_before == b.committed_position_before &&
+         a.committed_position_after == b.committed_position_after &&
+         a.pre_state_digest == b.pre_state_digest &&
+         a.post_state_digest == b.post_state_digest;
+}
+}  // namespace
 
 namespace {
 struct Crc32 {
@@ -55,6 +71,13 @@ struct DecodeFabric::Impl {
     CoordinatorEpoch in_flight_epoch;
     std::uint64_t in_flight_generation = 0;
     bool has_inflight = false;
+    // Transactional executor-state protocol state.
+    std::uint64_t committed_state_digest = 0;   // fabric's belief of committed executor state
+    bool state_digest_established = false;
+    GrantId in_flight_grant;
+    bool has_inflight_grant = false;
+    ProposalId in_flight_proposal;
+    std::uint64_t in_flight_position = 0;
     ReservationId reservation;
     StateDescriptor state;
     std::uint32_t attempt_count = 1;
@@ -66,6 +89,13 @@ struct DecodeFabric::Impl {
     std::uint64_t capacity = 0;
     std::uint64_t reserved = 0;
     std::uint64_t headroom_floor = 0;
+  };
+
+  struct GrantRecord {
+    CommitGrant grant;
+    int status = 0;  // 0 pending, 1 consumed, 2 aborted
+    MemberReceipt receipt;
+    bool has_receipt = false;
   };
 
   Config cfg;
@@ -87,6 +117,9 @@ struct DecodeFabric::Impl {
   Stats stats;
   std::unordered_map<WorkerId, WorkerBootId> worker_current_boot;
   std::uint64_t next_seq = 1, next_group = 1, next_dispatch = 1, next_reservation = 1;
+  std::uint64_t next_grant = 1;
+  std::unordered_map<GrantId, GrantRecord> grant_ledger;
+  std::uint64_t receipt_count = 0;
   std::unordered_map<std::string, std::vector<SequenceId>> prev_group_members;
 
   void ensure_clock() { if (!clock) { own_clock = std::make_unique<MonotonicClock>(); clock = own_clock.get(); } }
@@ -147,6 +180,93 @@ struct DecodeFabric::Impl {
     auto it = tenant_tokens.find(t);
     if (it == tenant_tokens.end()) tenant_tokens[t] = by;
     else { std::uint64_t v = it->second; if (v > UINT64_MAX - by) v = UINT64_MAX; else v += by; it->second = v; }
+  }
+
+  // Apply the non-commit outcome semantics of a member (yield, failure, cancel,
+  // expire). These never advance the authoritative generation and never touch
+  // executor-resident state; only fabric canonical state may transition.
+  // On a stale/authority rejection, the in-flight dispatch is no longer
+  // valid. Clear it, release the reservation, and place the sequence back into
+  // a candidate state so a later re-dispatch begins from a fresh dispatch and
+  // the unchanged committed pre-state.
+  void stale_reconcile(Seq& s, SequenceId seq) {
+    s.has_inflight = false;
+    s.in_flight_dispatch = DispatchId::null();
+    s.has_inflight_grant = false;
+    s.in_flight_grant = GrantId::null();
+    s.in_flight_proposal = ProposalId::null();
+    release_reservation(seq);
+    if (!is_terminal(s.machine.state()) &&
+        (s.machine.state() == SequenceState::Dispatched || s.machine.state() == SequenceState::Running)) {
+      s.machine.transition_to(SequenceState::StepCompleted);
+      s.machine.transition_to(SequenceState::Waiting);
+      s.ready_at = now();
+    }
+  }
+
+  void apply_noncommit_outcome(Seq& s, const MemberOutcome& mo) {
+    switch (mo.kind) {
+      case MemberOutcomeKind::Yielded: {
+        s.machine.transition_to(SequenceState::StepCompleted);
+        s.machine.transition_to(SequenceState::Yielded);
+        s.ready_at = mo.finished_at;
+        record_event(EventKind::Yielding, s.req.id, mo.sequence, "yielded");
+        break;
+      }
+      case MemberOutcomeKind::RetryableFailure: {
+        release_reservation(mo.sequence);
+        if (s.machine.state() == SequenceState::Dispatched) s.machine.transition_to(SequenceState::RetryableFailure);
+        if (s.attempt_count >= cfg.retry_policy.max_attempts) {
+          s.machine.transition_to(SequenceState::NonRetryableFailure);
+          terminal_records[mo.sequence] = SequenceState::NonRetryableFailure;
+          stats.sequences_failed++;
+          record_event(EventKind::RetryFailed, s.req.id, mo.sequence, "retry_budget_exhausted");
+        } else {
+          if (!cfg.retry_policy.preserve_committed_tokens) {
+            s.generated = s.committed;
+            s.budget = TokenBudget(s.req.max_generation_length);
+            for (std::uint64_t kk = 0; kk < s.committed; ++kk) s.budget.advance(1);
+          }
+          s.current_attempt = AttemptId::from(next_dispatch + 1000000);
+          ++s.attempt_count;
+          s.machine.transition_to(SequenceState::Retrying);
+          s.machine.transition_to(SequenceState::Ready);
+          s.ready_at = now();
+          stats.retries++;
+          record_event(EventKind::RetryStarted, s.req.id, mo.sequence, "new_attempt");
+        }
+        break;
+      }
+      case MemberOutcomeKind::NonRetryableFailure: {
+        if (s.machine.state() == SequenceState::Dispatched) s.machine.transition_to(SequenceState::NonRetryableFailure);
+        tenant_active[s.req.tenant] = std::max(0u, tenant_active[s.req.tenant] - 1u);
+        stats.sequences_failed++;
+        terminal_records[mo.sequence] = SequenceState::NonRetryableFailure;
+        record_event(EventKind::RequestRejected, s.req.id, mo.sequence, mo.error_message);
+        break;
+      }
+      case MemberOutcomeKind::Cancelled: {
+        if (!is_terminal(s.machine.state())) {
+          s.machine.transition_to(SequenceState::Cancelled);
+          tenant_active[s.req.tenant] = std::max(0u, tenant_active[s.req.tenant] - 1u);
+          stats.cancellations++; stats.sequences_cancelled++;
+          terminal_records[mo.sequence] = SequenceState::Cancelled;
+          record_event(EventKind::SequenceCancelled, s.req.id, mo.sequence, "backend_cancel");
+        }
+        break;
+      }
+      case MemberOutcomeKind::Expired: {
+        if (!is_terminal(s.machine.state())) {
+          s.machine.transition_to(SequenceState::DeadlineExpired);
+          tenant_active[s.req.tenant] = std::max(0u, tenant_active[s.req.tenant] - 1u);
+          stats.deadline_misses++; stats.sequences_expired++;
+          terminal_records[mo.sequence] = SequenceState::DeadlineExpired;
+          record_event(EventKind::SequenceExpired, s.req.id, mo.sequence, "backend_expired");
+        }
+        break;
+      }
+      default: break;
+    }
   }
 
   void refresh_derived_stats() {
@@ -708,117 +828,363 @@ Result<void> DecodeFabric::apply_completion(const DecodeExecutionResult& result)
       continue;
     }
 
-    // The completion is authoritative. Clear in-flight authority FIRST so a
-    // duplicate completion is rejected thereafter.
+    // Authority is current. Under the transactional executor-state model a
+    // successful step may only finalize through a validated commit receipt, so
+    // a bare completion here is NOT authoritative. Reject it deterministically
+    // (no fabric advance, no executor-committed advance) and request an abort.
+    if (mo.kind == MemberOutcomeKind::StepSuccessContinue ||
+        mo.kind == MemberOutcomeKind::StepSuccessTerminal) {
+      impl_->stats.stale_rejections++;
+      impl_->record_event(EventKind::StaleRejected, s.req.id, mo.sequence, "completion_without_receipt");
+      continue;
+    }
+    // Non-commit member outcome: clear in-flight dispatch, release the
+    // reservation, and apply outcome semantics without advancing executor state.
     s.has_inflight = false;
     s.in_flight_dispatch = DispatchId::null();
     impl_->release_reservation(mo.sequence);
-
-    switch (mo.kind) {
-      case MemberOutcomeKind::StepSuccessContinue:
-      case MemberOutcomeKind::StepSuccessTerminal: {
-        // Advance exactly one authoritative generation.
-        if (mo.generated != 0 && mo.generated != 1) {
-          return failed<void>(ErrorCode::InvalidArgument, "continue outcome must advance exactly one token");
-        }
-        auto adv = s.budget.advance(1);
-        if (!adv.ok()) {
-          s.machine.transition_to(SequenceState::Completed);
-          impl_->terminal_records[mo.sequence] = SequenceState::Completed;
-          impl_->stats.sequences_completed++;
-          impl_->record_event(EventKind::SequenceCompleted, s.req.id, mo.sequence, "budget_exhausted");
-          continue;
-        }
-        Nanoseconds prev_token = s.last_token_at.ns;
-        s.generated += 1;
-        s.committed += 1;
-        s.current_length += 1;
-        ++s.generation;
-        s.last_token_at = mo.finished_at;
-        impl_->stats.decode_steps++;
-        impl_->stats.generated_tokens++;
-        impl_->stats.total_active_ns += mo.active_ns;
-        if (prev_token != 0) impl_->stats.total_inter_token_ns += (mo.finished_at.ns - prev_token);
-        impl_->update_tenant_tokens(s.req.tenant, 1);
-        impl_->record_event(EventKind::StepCompleted, s.req.id, mo.sequence, "token " + std::to_string(s.generated));
-        if (mo.kind == MemberOutcomeKind::StepSuccessTerminal || s.budget.exhausted()) {
-          s.machine.transition_to(SequenceState::StepCompleted);
-          s.machine.transition_to(SequenceState::Completed);
-          impl_->tenant_active[s.req.tenant] = std::max(0u, impl_->tenant_active[s.req.tenant] - 1u);
-          impl_->stats.sequences_completed++;
-          impl_->terminal_records[mo.sequence] = SequenceState::Completed;
-          impl_->record_event(EventKind::SequenceCompleted, s.req.id, mo.sequence, "terminal");
-        } else {
-          s.machine.transition_to(SequenceState::StepCompleted);
-          s.machine.transition_to(SequenceState::ReadyForNextToken);
-          s.ready_at = mo.finished_at;
-        }
-        break;
-      }
-      case MemberOutcomeKind::Yielded: {
-        s.machine.transition_to(SequenceState::StepCompleted);
-        s.machine.transition_to(SequenceState::Yielded);
-        s.ready_at = mo.finished_at;
-        impl_->record_event(EventKind::Yielding, s.req.id, mo.sequence, "yielded");
-        break;
-      }
-      case MemberOutcomeKind::RetryableFailure: {
-        impl_->release_reservation(mo.sequence);
-        if (s.machine.state() == SequenceState::Dispatched) s.machine.transition_to(SequenceState::RetryableFailure);
-        if (s.attempt_count >= impl_->cfg.retry_policy.max_attempts) {
-          s.machine.transition_to(SequenceState::NonRetryableFailure);
-          impl_->terminal_records[mo.sequence] = SequenceState::NonRetryableFailure;
-          impl_->stats.sequences_failed++;
-          impl_->record_event(EventKind::RetryFailed, s.req.id, mo.sequence, "retry_budget_exhausted");
-        } else {
-          if (!impl_->cfg.retry_policy.preserve_committed_tokens) {
-            s.generated = s.committed;
-            s.budget = TokenBudget(s.req.max_generation_length);
-            for (std::uint64_t kk = 0; kk < s.committed; ++kk) s.budget.advance(1);
-          }
-          s.current_attempt = AttemptId::from(impl_->next_dispatch + 1000000);
-          ++s.attempt_count;
-          s.machine.transition_to(SequenceState::Retrying);
-          s.machine.transition_to(SequenceState::Ready);
-          s.ready_at = impl_->now();
-          impl_->stats.retries++;
-          impl_->record_event(EventKind::RetryStarted, s.req.id, mo.sequence, "new_attempt");
-        }
-        break;
-      }
-      case MemberOutcomeKind::NonRetryableFailure: {
-        if (s.machine.state() == SequenceState::Dispatched) s.machine.transition_to(SequenceState::NonRetryableFailure);
-        impl_->tenant_active[s.req.tenant] = std::max(0u, impl_->tenant_active[s.req.tenant] - 1u);
-        impl_->stats.sequences_failed++;
-        impl_->terminal_records[mo.sequence] = SequenceState::NonRetryableFailure;
-        impl_->record_event(EventKind::RequestRejected, s.req.id, mo.sequence, mo.error_message);
-        break;
-      }
-      case MemberOutcomeKind::Cancelled: {
-        if (!is_terminal(s.machine.state())) {
-          s.machine.transition_to(SequenceState::Cancelled);
-          impl_->tenant_active[s.req.tenant] = std::max(0u, impl_->tenant_active[s.req.tenant] - 1u);
-          impl_->stats.cancellations++; impl_->stats.sequences_cancelled++;
-          impl_->terminal_records[mo.sequence] = SequenceState::Cancelled;
-          impl_->record_event(EventKind::SequenceCancelled, s.req.id, mo.sequence, "backend_cancel");
-        }
-        break;
-      }
-      case MemberOutcomeKind::Expired: {
-        if (!is_terminal(s.machine.state())) {
-          s.machine.transition_to(SequenceState::DeadlineExpired);
-          impl_->tenant_active[s.req.tenant] = std::max(0u, impl_->tenant_active[s.req.tenant] - 1u);
-          impl_->stats.deadline_misses++; impl_->stats.sequences_expired++;
-          impl_->terminal_records[mo.sequence] = SequenceState::DeadlineExpired;
-          impl_->record_event(EventKind::SequenceExpired, s.req.id, mo.sequence, "backend_expired");
-        }
-        break;
-      }
-      default: break;
-    }
+    impl_->apply_noncommit_outcome(s, mo);
   }
   impl_->refresh_derived_stats();
   return Result<void>::success();
+}
+
+
+// ===========================================================================
+// Transactional executor-state protocol
+// ===========================================================================
+Result<DecodeFabric::AuthorizeResult> DecodeFabric::authorize_prepared(const PreparedDecode& prepared) {
+  std::unique_lock lk(impl_->mtx);
+  AuthorizeResult ar;
+  ar.dispatch_id = prepared.dispatch_id;
+  ar.epoch = prepared.epoch;
+  ar.worker = prepared.worker;
+  ar.worker_boot = prepared.worker_boot;
+  for (const PreparedMember& pm : prepared.members) {
+    GrantOrAbort ga;
+    ga.proposal = pm.proposal;
+    {  // default abort target (authority tuple) for stale/non-commit members
+      AbortPrepared abi;
+      abi.proposal = pm.proposal; abi.sequence = pm.sequence; abi.state = pm.state;
+      abi.attempt = pm.attempt; abi.generation = pm.generation; abi.dispatch = pm.dispatch;
+      abi.epoch = pm.epoch; abi.worker = pm.worker; abi.worker_boot = pm.worker_boot;
+      ga.abort_spec = std::move(abi);
+      ga.has_abort = true;
+    }
+    auto it = impl_->seqs.find(pm.sequence);
+    if (it == impl_->seqs.end()) {
+      impl_->stats.stale_rejections++;
+      impl_->record_event(EventKind::StaleRejected, {}, pm.sequence, "unknown_sequence");
+      ga.rejected = true; ga.aborted = true; ga.error_code = ErrorCode::UnknownSequence; ga.reason = "unknown_sequence";
+      ar.members.push_back(std::move(ga));
+      continue;
+    }
+    Impl::Seq& s = it->second;
+
+    // --- Authority validation, most-stale first. ---
+    if (pm.epoch != impl_->epoch) {
+      impl_->stale_reconcile(s, pm.sequence);
+      impl_->stats.stale_rejections++;
+      impl_->record_event(EventKind::StaleRejected, s.req.id, pm.sequence, "stale_epoch");
+      ga.rejected = true; ga.aborted = true; ga.error_code = ErrorCode::StaleCoordinatorEpoch; ga.reason = "stale_epoch";
+      ar.members.push_back(std::move(ga));
+      continue;
+    }
+    auto wit = impl_->worker_current_boot.find(pm.worker);
+    if (wit != impl_->worker_current_boot.end() && wit->second != pm.worker_boot) {
+      impl_->stale_reconcile(s, pm.sequence);
+      impl_->stats.stale_rejections++;
+      impl_->record_event(EventKind::StaleRejected, s.req.id, pm.sequence, "stale_worker_boot");
+      ga.rejected = true; ga.aborted = true; ga.error_code = ErrorCode::StaleWorkerBoot; ga.reason = "stale_worker_boot";
+      ar.members.push_back(std::move(ga));
+      continue;
+    }
+    if (pm.attempt != s.current_attempt) {
+      impl_->stale_reconcile(s, pm.sequence);
+      impl_->stats.stale_rejections++;
+      impl_->record_event(EventKind::StaleRejected, s.req.id, pm.sequence, "stale_attempt");
+      ga.rejected = true; ga.aborted = true; ga.error_code = ErrorCode::StaleAttempt; ga.reason = "stale_attempt";
+      ar.members.push_back(std::move(ga));
+      continue;
+    }
+    if (pm.generation.value() != s.in_flight_generation) {
+      impl_->stale_reconcile(s, pm.sequence);
+      impl_->stats.stale_rejections++;
+      impl_->record_event(EventKind::StaleRejected, s.req.id, pm.sequence, "stale_generation");
+      ga.rejected = true; ga.aborted = true; ga.error_code = ErrorCode::StaleDecodeGeneration; ga.reason = "stale_generation";
+      ar.members.push_back(std::move(ga));
+      continue;
+    }
+    if (pm.dispatch != s.in_flight_dispatch) {
+      impl_->stale_reconcile(s, pm.sequence);
+      impl_->stats.stale_rejections++;
+      impl_->record_event(EventKind::StaleRejected, s.req.id, pm.sequence, "stale_dispatch");
+      ga.rejected = true; ga.aborted = true; ga.error_code = ErrorCode::DuplicateCompletion; ga.reason = "stale_dispatch";
+      ar.members.push_back(std::move(ga));
+      continue;
+    }
+    if (is_terminal(s.machine.state())) {
+      impl_->stale_reconcile(s, pm.sequence);
+      impl_->stats.stale_rejections++;
+      impl_->record_event(EventKind::StaleRejected, s.req.id, pm.sequence, "completion_for_terminal");
+      ga.rejected = true; ga.aborted = true; ga.error_code = ErrorCode::CompletionForTerminal; ga.reason = "terminal";
+      ar.members.push_back(std::move(ga));
+      continue;
+    }
+    if (s.machine.state() == SequenceState::CancelRequested || s.machine.state() == SequenceState::Cancelled) {
+      impl_->stale_reconcile(s, pm.sequence);
+      impl_->stats.stale_rejections++;
+      impl_->record_event(EventKind::StaleRejected, s.req.id, pm.sequence, "completion_for_cancelled");
+      ga.rejected = true; ga.aborted = true; ga.error_code = ErrorCode::CompletionForCancelled; ga.reason = "cancelled";
+      ar.members.push_back(std::move(ga));
+      continue;
+    }
+    if (s.machine.state() == SequenceState::DeadlineExpired) {
+      impl_->stale_reconcile(s, pm.sequence);
+      impl_->stats.stale_rejections++;
+      impl_->record_event(EventKind::StaleRejected, s.req.id, pm.sequence, "completion_for_expired");
+      ga.rejected = true; ga.aborted = true; ga.error_code = ErrorCode::CompletionForExpired; ga.reason = "expired";
+      ar.members.push_back(std::move(ga));
+      continue;
+    }
+
+    if (!pm.is_commit_eligible()) {
+      // Non-commit outcome: apply outcome semantics (no executor advance) and
+      // request an abort of any prepared transition.
+      s.has_inflight = false;
+      s.in_flight_dispatch = DispatchId::null();
+      impl_->release_reservation(pm.sequence);
+      impl_->apply_noncommit_outcome(s, pm.outcome);
+      ga.aborted = true;
+      ga.outcome = pm.outcome;
+      ar.members.push_back(std::move(ga));
+      continue;
+    }
+
+    // Commit-eligible: validate the transaction binding before issuing a grant.
+    if (s.has_inflight_grant) {
+      impl_->stale_reconcile(s, pm.sequence);
+      impl_->stats.stale_rejections++;
+      ga.rejected = true; ga.aborted = true; ga.error_code = ErrorCode::TransactionConflict;
+      ga.reason = "conflicting pending grant for sequence+generation";
+      ar.members.push_back(std::move(ga));
+      continue;
+    }
+    if (pm.committed_position_before != s.generated) {
+      impl_->stale_reconcile(s, pm.sequence);
+      impl_->stats.stale_rejections++;
+      ga.rejected = true; ga.aborted = true; ga.error_code = ErrorCode::InvalidArgument;
+      ga.reason = "committed-position mismatch";
+      ar.members.push_back(std::move(ga));
+      continue;
+    }
+    if (s.state_digest_established && pm.pre_state_digest != s.committed_state_digest) {
+      impl_->stale_reconcile(s, pm.sequence);
+      impl_->stats.stale_rejections++;
+      ga.rejected = true; ga.aborted = true; ga.error_code = ErrorCode::StateDigestMismatch;
+      ga.reason = "pre-state digest does not match committed executor state";
+      ar.members.push_back(std::move(ga));
+      continue;
+    }
+    // Issue a one-use commit grant bound to the full authority/proposal tuple.
+    GrantId gid = GrantId::from(impl_->next_grant++);
+    CommitGrant g;
+    g.grant_id = gid;
+    g.proposal = pm.proposal;
+    g.epoch = prepared.epoch;
+    g.worker = prepared.worker;
+    g.worker_boot = prepared.worker_boot;
+    g.sequence = pm.sequence;
+    g.state = pm.state;
+    g.attempt = pm.attempt;
+    g.generation = pm.generation;
+    g.dispatch = pm.dispatch;
+    g.committed_position = pm.committed_position_before;
+    g.pre_state_digest = pm.pre_state_digest;
+    g.post_state_digest = pm.post_state_digest;
+    g.delta_digest = pm.delta_digest;
+    g.outcome_kind = pm.outcome.kind;
+    g.terminal = pm.outcome.terminal;
+    g.token_identifier = static_cast<std::uint32_t>(pm.outcome.token_identifier);
+    g.active_ns = pm.active_ns;
+    Impl::GrantRecord gr;
+    gr.grant = g;
+    gr.status = 0;
+    impl_->grant_ledger[gid] = gr;
+    s.in_flight_grant = gid;
+    s.has_inflight_grant = true;
+    s.in_flight_proposal = pm.proposal;
+    s.in_flight_position = pm.committed_position_before;
+    ga.has_grant = true;
+    ga.grant = g;
+    ga.has_abort = false;  // this member commits, not aborts
+    ar.members.push_back(std::move(ga));
+    impl_->record_event(EventKind::ReservationGranted, s.req.id, pm.sequence, "commit_grant_issued");
+  }
+  return Result<AuthorizeResult>::ok(std::move(ar));
+}
+
+Result<void> DecodeFabric::apply_commit_receipt(const ReceiptDecode& receipts) {
+  std::unique_lock lk(impl_->mtx);
+  for (const MemberReceipt& rec : receipts.receipts) {
+    auto git = impl_->grant_ledger.find(rec.grant_id);
+    if (git == impl_->grant_ledger.end()) {
+      impl_->stats.stale_rejections++;
+      impl_->record_event(EventKind::StaleRejected, {}, rec.sequence, "unknown_grant");
+      continue;
+    }
+    Impl::GrantRecord& gr = git->second;
+    if (gr.status == 1) {  // already consumed
+      if (gr.has_receipt && receipts_match(gr.receipt, rec)) continue;  // idempotent
+      impl_->stats.stale_rejections++;
+      impl_->record_event(EventKind::StaleRejected, {}, rec.sequence, "conflicting_duplicate_receipt");
+      continue;
+    }
+    if (gr.status == 2) {  // aborted
+      impl_->stats.stale_rejections++;
+      impl_->record_event(EventKind::StaleRejected, {}, rec.sequence, "aborted_grant");
+      continue;
+    }
+    // Validate the receipt against the issued one-use grant.
+    const CommitGrant& g = gr.grant;
+    if (!(rec.grant_id == g.grant_id && rec.proposal == g.proposal &&
+          rec.sequence == g.sequence && rec.state == g.state &&
+          rec.attempt == g.attempt && rec.generation == g.generation &&
+          rec.worker_boot == g.worker_boot && rec.epoch == g.epoch &&
+          rec.dispatch == g.dispatch &&
+          rec.committed_position_before == g.committed_position &&
+          rec.pre_state_digest == g.pre_state_digest &&
+          rec.post_state_digest == g.post_state_digest)) {
+      impl_->stats.stale_rejections++;
+      impl_->record_event(EventKind::StaleRejected, {}, rec.sequence, "receipt_grant_mismatch");
+      continue;
+    }
+    auto sit = impl_->seqs.find(rec.sequence);
+    if (sit == impl_->seqs.end()) {
+      impl_->stats.stale_rejections++;
+      impl_->record_event(EventKind::StaleRejected, {}, rec.sequence, "unknown_sequence");
+      continue;
+    }
+    Impl::Seq& s = sit->second;
+    if (!s.has_inflight_grant || s.in_flight_grant != rec.grant_id ||
+        s.in_flight_proposal != rec.proposal) {
+      impl_->stats.stale_rejections++;
+      impl_->record_event(EventKind::StaleRejected, s.req.id, rec.sequence, "grant_not_inflight");
+      continue;
+    }
+    if (is_terminal(s.machine.state()) || s.machine.state() == SequenceState::CancelRequested ||
+        s.machine.state() == SequenceState::Cancelled || s.machine.state() == SequenceState::DeadlineExpired) {
+      impl_->stats.stale_rejections++;
+      impl_->record_event(EventKind::StaleRejected, s.req.id, rec.sequence, "completion_for_terminal");
+      continue;
+    }
+
+    // Finalize exactly one authoritative generation.
+    auto adv = s.budget.advance(1);
+    Nanoseconds prev_token = s.last_token_at.ns;
+    s.generated += 1;
+    s.committed += 1;
+    s.current_length += 1;
+    ++s.generation;
+    TimePoint fin = rec.committed_at.ns ? rec.committed_at : impl_->now();
+    s.last_token_at = fin;
+    impl_->stats.decode_steps++;
+    impl_->stats.generated_tokens++;
+    impl_->stats.total_active_ns += rec.active_ns;
+    if (prev_token != 0) impl_->stats.total_inter_token_ns += (fin.ns - prev_token);
+    impl_->update_tenant_tokens(s.req.tenant, 1);
+    impl_->record_event(EventKind::StepCompleted, s.req.id, rec.sequence, "token " + std::to_string(s.generated));
+
+    // Receipt chain: this committed post-state becomes the next generation's
+    // expected committed pre-state.
+    s.committed_state_digest = rec.post_state_digest;
+    s.state_digest_established = true;
+
+    bool terminal = rec.terminal || s.budget.exhausted();
+    if (terminal) {
+      s.machine.transition_to(SequenceState::StepCompleted);
+      s.machine.transition_to(SequenceState::Completed);
+      impl_->tenant_active[s.req.tenant] = std::max(0u, impl_->tenant_active[s.req.tenant] - 1u);
+      impl_->stats.sequences_completed++;
+      impl_->terminal_records[rec.sequence] = SequenceState::Completed;
+      impl_->record_event(EventKind::SequenceCompleted, s.req.id, rec.sequence, "terminal");
+    } else {
+      s.machine.transition_to(SequenceState::StepCompleted);
+      s.machine.transition_to(SequenceState::ReadyForNextToken);
+      s.ready_at = fin;
+    }
+
+    // Close the transaction.
+    gr.status = 1;
+    gr.receipt = rec;
+    gr.has_receipt = true;
+    s.has_inflight = false;
+    s.in_flight_dispatch = DispatchId::null();
+    impl_->release_reservation(rec.sequence);
+    s.has_inflight_grant = false;
+    s.in_flight_grant = GrantId::null();
+    s.in_flight_proposal = ProposalId::null();
+    impl_->receipt_count++;
+    impl_->record_event(EventKind::ReservationReleased, s.req.id, rec.sequence, "receipt_consumed");
+  }
+  impl_->refresh_derived_stats();
+  return Result<void>::success();
+}
+
+Result<void> DecodeFabric::abort_prepared(const AbortPrepared& abort) {
+  std::unique_lock lk(impl_->mtx);
+  auto it = impl_->seqs.find(abort.sequence);
+  if (it == impl_->seqs.end()) return Result<void>::success();
+  Impl::Seq& s = it->second;
+  if (s.has_inflight_grant && s.in_flight_proposal == abort.proposal) {
+    auto git = impl_->grant_ledger.find(s.in_flight_grant);
+    if (git != impl_->grant_ledger.end() && git->second.status == 0) git->second.status = 2;
+    s.has_inflight_grant = false;
+    s.in_flight_grant = GrantId::null();
+    s.in_flight_proposal = ProposalId::null();
+    s.in_flight_position = 0;
+    // Clear the dispatch so the sequence can be re-dispatched under fresh
+    // authority (committed executor state is unchanged).
+    s.has_inflight = false;
+    impl_->release_reservation(abort.sequence);
+    if (!is_terminal(s.machine.state()) &&
+        (s.machine.state() == SequenceState::Dispatched || s.machine.state() == SequenceState::Running)) {
+      s.machine.transition_to(SequenceState::StepCompleted);
+      s.machine.transition_to(SequenceState::Waiting);
+      s.ready_at = impl_->now();
+    }
+    impl_->record_event(EventKind::StaleRejected, s.req.id, abort.sequence, "aborted_prepared");
+  }
+  return Result<void>::success();
+}
+
+std::uint64_t DecodeFabric::sequence_committed_digest(SequenceId seq) const {
+  std::shared_lock lk(impl_->mtx);
+  auto it = impl_->seqs.find(seq);
+  return it == impl_->seqs.end() ? 0 : it->second.committed_state_digest;
+}
+
+bool DecodeFabric::has_pending_grant(SequenceId seq) const {
+  std::shared_lock lk(impl_->mtx);
+  auto it = impl_->seqs.find(seq);
+  return it != impl_->seqs.end() && it->second.has_inflight_grant;
+}
+
+GrantId DecodeFabric::pending_grant(SequenceId seq) const {
+  std::shared_lock lk(impl_->mtx);
+  auto it = impl_->seqs.find(seq);
+  return it == impl_->seqs.end() ? GrantId::null() : it->second.in_flight_grant;
+}
+
+int DecodeFabric::grant_status(GrantId grant) const {
+  std::shared_lock lk(impl_->mtx);
+  auto it = impl_->grant_ledger.find(grant);
+  return it == impl_->grant_ledger.end() ? -1 : it->second.status;
+}
+
+std::uint64_t DecodeFabric::receipt_count() const {
+  std::shared_lock lk(impl_->mtx);
+  return impl_->receipt_count;
 }
 
 // ===========================================================================
@@ -838,24 +1204,72 @@ std::vector<Dispatch> DecodeFabric::pump_once(DecodeExecutor& executor, TimePoin
     req.reservation_id = d.reservation.value();
     req.members = d.members;
     { std::string k = d.key.to_string(); req.group_payload.assign(k.begin(), k.end()); }
-    Result<DecodeExecutionResult> res = executor.execute(req);
-    if (!res.ok()) {
-      // Simulate a fail-safe: mark all members failed and let apply_completion
-      // handle it. But apply_completion needs a result; build one.
+
+    // PREPARE
+    auto prep = executor.prepare(req);
+    if (!prep.ok()) {
+      // Backend-level prepare failure: report a retryable failure for each
+      // member through the non-commit outcome path (no executor advance).
       DecodeExecutionResult r;
       r.dispatch_id = d.id;
       r.epoch = d.epoch;
       r.worker = d.worker;
       r.worker_boot = d.worker_boot;
+      r.group_error = prep.error().code;
+      r.group_error_message = prep.error().message;
       for (const DecodeMemberSpec& m : d.members) {
         MemberOutcome mo; mo.sequence = m.sequence; mo.kind = MemberOutcomeKind::RetryableFailure;
-        mo.attempt = m.attempt; mo.generation = m.generation; mo.error_message = res.error().message;
+        mo.attempt = m.attempt; mo.generation = m.generation; mo.error_message = prep.error().message;
+        mo.retryable = true;
         r.outcomes.push_back(mo);
       }
       apply_completion(r);
       continue;
     }
-    apply_completion(res.value());
+    PreparedDecode pd = std::move(prep.value());
+
+    // AUTHORIZE
+    auto auth = authorize_prepared(pd);
+    if (!auth.ok()) {
+      // Fabric-level authorize failure (should not happen for a valid prepare;
+      // if it does, abort every prepared member on the executor).
+      for (const PreparedMember& pm : pd.members) {
+        AbortPrepared ab;
+        ab.proposal = pm.proposal; ab.sequence = pm.sequence; ab.state = pm.state;
+        ab.attempt = pm.attempt; ab.generation = pm.generation; ab.dispatch = pm.dispatch;
+        ab.epoch = pm.epoch; ab.worker = pm.worker; ab.worker_boot = pm.worker_boot;
+        (void)executor.abort(ab);
+      }
+      continue;
+    }
+    AuthorizeResult ar = std::move(auth.value());
+
+    // COMMIT (or ABORT) per member, then RECEIPT/finalize.
+    ReceiptDecode rd;
+    rd.dispatch_id = d.id;
+    rd.epoch = d.epoch;
+    rd.worker = d.worker;
+    rd.worker_boot = d.worker_boot;
+    for (std::size_t i = 0; i < ar.members.size(); ++i) {
+      GrantOrAbort& ga = ar.members[i];
+      if (ga.rejected || ga.aborted || !ga.has_grant) {
+        // Stale/rejected/non-commit member: the fabric already recorded the
+        // rejection/outcome; discard the prepared transition on the executor.
+        if (ga.has_abort) (void)executor.abort(ga.abort_spec);
+        continue;
+      }
+      auto cr = executor.commit(ga.grant);
+      if (cr.ok()) {
+        MemberReceipt mr = std::move(cr.value());
+        mr.committed_at = tn;
+        rd.receipts.push_back(std::move(mr));
+      } else {
+        // Commit rejected (e.g. conflict): abort the prepared transition.
+        if (ga.has_abort) (void)executor.abort(ga.abort_spec);
+      }
+    }
+    // FINALIZE (fabric canonical advance only after confirmed receipts).
+    (void)apply_commit_receipt(rd);
   }
   return ds;
 }
@@ -1044,6 +1458,9 @@ Result<std::vector<std::uint8_t>> DecodeFabric::serialize_state() const {
     w.u64(s.state.bytes_held); w.u64(s.state.estimated_growth);
     w.u64(s.state.owner_tag);
     w.u32(s.attempt_count);
+    // Transactional executor-state protocol metadata.
+    w.u64(s.committed_state_digest);
+    w.u8(s.state_digest_established ? 1 : 0);
   }
   // terminal records
   std::uint64_t tcount = static_cast<std::uint64_t>(impl_->terminal_records.size());
@@ -1052,6 +1469,35 @@ Result<std::vector<std::uint8_t>> DecodeFabric::serialize_state() const {
     w.u64(kv.first.value());
     w.u8(static_cast<std::uint8_t>(kv.second));
   }
+  // Grant ledger (transactional protocol) + receipt count.
+  std::uint64_t gcnt = static_cast<std::uint64_t>(impl_->grant_ledger.size());
+  w.u64(gcnt);
+  for (const auto& kv : impl_->grant_ledger) {
+    const Impl::GrantRecord& gr = kv.second;
+    const CommitGrant& g = gr.grant;
+    w.u64(g.grant_id.value()); w.u64(g.proposal.value());
+    w.u64(g.epoch.value()); w.u64(g.worker.value()); w.u64(g.worker_boot.value());
+    w.u64(g.sequence.value()); w.u64(g.state.value()); w.u64(g.attempt.value());
+    w.u64(g.generation.value()); w.u64(g.dispatch.value());
+    w.u64(g.committed_position);
+    w.u64(g.pre_state_digest); w.u64(g.post_state_digest); w.u64(g.delta_digest);
+    w.u8(static_cast<std::uint8_t>(g.outcome_kind)); w.u8(g.terminal ? 1 : 0);
+    w.u32(g.token_identifier); w.ns(g.active_ns);
+    w.u32(static_cast<std::uint32_t>(gr.status));
+    w.u8(gr.has_receipt ? 1 : 0);
+    if (gr.has_receipt) {
+      const MemberReceipt& rp = gr.receipt;
+      w.u64(rp.receipt_id.value()); w.u64(rp.grant_id.value()); w.u64(rp.proposal.value());
+      w.u64(rp.epoch.value()); w.u64(rp.worker.value()); w.u64(rp.worker_boot.value());
+      w.u64(rp.sequence.value()); w.u64(rp.state.value()); w.u64(rp.attempt.value());
+      w.u64(rp.generation.value()); w.u64(rp.dispatch.value());
+      w.u64(rp.committed_position_before); w.u64(rp.committed_position_after);
+      w.u64(rp.pre_state_digest); w.u64(rp.post_state_digest); w.u64(rp.delta_digest);
+      w.u8(static_cast<std::uint8_t>(rp.outcome_kind)); w.u8(rp.terminal ? 1 : 0);
+      w.u32(rp.token_identifier); w.ns(rp.active_ns); w.ns(rp.committed_at.ns);
+    }
+  }
+  w.u64(impl_->receipt_count);
   std::vector<std::uint8_t> body = w.take();
   std::uint32_t crc = Crc32::update(0xFFFFFFFFu, body.data(), body.size());
   crc = ~crc;
@@ -1143,9 +1589,17 @@ Result<void> DecodeFabric::recover_state(const std::vector<std::uint8_t>& bytes)
     s.state.estimated_growth = eg.value();
     s.state.owner_tag = ot.value();
     s.attempt_count = ac.value();
+    // Transactional executor-state protocol metadata.
+    auto csd = r.u64(); if (!csd.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "committed digest");
+    auto sde = r.u8(); if (!sde.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "digest established");
+    s.committed_state_digest = csd.value();
+    s.state_digest_established = sde.value() != 0;
     // Never restore a stale in-flight authority as current.
     s.has_inflight = false;
     s.in_flight_dispatch = DispatchId::null();
+    s.has_inflight_grant = false;
+    s.in_flight_grant = GrantId::null();
+    s.in_flight_proposal = ProposalId::null();
     SequenceState restored = static_cast<SequenceState>(st.value());
     if (restored == SequenceState::Dispatched || restored == SequenceState::Running ||
         restored == SequenceState::Reserved || restored == SequenceState::Grouped ||
@@ -1168,6 +1622,84 @@ Result<void> DecodeFabric::recover_state(const std::vector<std::uint8_t>& bytes)
     auto tst = r.u8(); if (!tst.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "t state");
     impl_->terminal_records[SequenceId::from(tseq.value())] = static_cast<SequenceState>(tst.value());
   }
+  // Grant ledger (transactional protocol) + receipt count.
+  impl_->grant_ledger.clear();
+  impl_->receipt_count = 0;
+  auto gcnt = r.u64(); if (!gcnt.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "grant count");
+  if (gcnt.value() > (1ull << 22)) return failed<void>(ErrorCode::PersistenceInvalidField, "grant count too large");
+  for (std::uint64_t i = 0; i < gcnt.value(); ++i) {
+    Impl::GrantRecord gr;
+    auto gid = r.u64(); if (!gid.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "grant id");
+    auto pro = r.u64(); if (!pro.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "grant proposal");
+    auto g_ep = r.u64(); if (!g_ep.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "grant epoch");
+    auto wk = r.u64(); if (!wk.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "grant worker");
+    auto wb = r.u64(); if (!wb.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "grant boot");
+    auto sq = r.u64(); if (!sq.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "grant seq");
+    auto st2 = r.u64(); if (!st2.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "grant state");
+    auto at = r.u64(); if (!at.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "grant attempt");
+    auto gn = r.u64(); if (!gn.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "grant generation");
+    auto di = r.u64(); if (!di.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "grant dispatch");
+    auto cp = r.u64(); if (!cp.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "grant position");
+    auto pre = r.u64(); if (!pre.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "grant pre");
+    auto post = r.u64(); if (!post.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "grant post");
+    auto dd = r.u64(); if (!dd.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "grant delta");
+    auto ok = r.u8(); if (!ok.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "grant ok");
+    auto term = r.u8(); if (!term.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "grant term");
+    auto tok = r.u32(); if (!tok.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "grant token");
+    auto an = r.ns(); if (!an.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "grant active");
+    auto status = r.u32(); if (!status.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "grant status");
+    auto has_rec = r.u8(); if (!has_rec.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "grant has receipt");
+    gr.grant.grant_id = GrantId::from(gid.value()); gr.grant.proposal = ProposalId::from(pro.value());
+    gr.grant.epoch = CoordinatorEpoch::from(g_ep.value()); gr.grant.worker = WorkerId::from(wk.value());
+    gr.grant.worker_boot = WorkerBootId::from(wb.value()); gr.grant.sequence = SequenceId::from(sq.value());
+    gr.grant.state = StateId::from(st2.value()); gr.grant.attempt = AttemptId::from(at.value());
+    gr.grant.generation = DecodeGeneration::from(gn.value()); gr.grant.dispatch = DispatchId::from(di.value());
+    gr.grant.committed_position = cp.value(); gr.grant.pre_state_digest = pre.value();
+    gr.grant.post_state_digest = post.value(); gr.grant.delta_digest = dd.value();
+    gr.grant.outcome_kind = static_cast<MemberOutcomeKind>(ok.value()); gr.grant.terminal = term.value() != 0;
+    gr.grant.token_identifier = tok.value(); gr.grant.active_ns = an.value();
+    // A pending grant must not be revived after restart: it becomes stale.
+    gr.status = (status.value() == 0) ? 2 : static_cast<int>(status.value());
+    if (has_rec.value() != 0) {
+      MemberReceipt rp;
+      auto ra = r.u64(); if (!ra.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "receipt id");
+      auto rb = r.u64(); if (!rb.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "receipt grant");
+      auto rc = r.u64(); if (!rc.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "receipt proposal");
+      auto rd = r.u64(); if (!rd.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "receipt epoch");
+      auto re = r.u64(); if (!re.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "receipt worker");
+      auto rf = r.u64(); if (!rf.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "receipt boot");
+      auto rg = r.u64(); if (!rg.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "receipt seq");
+      auto rh = r.u64(); if (!rh.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "receipt state");
+      auto ri = r.u64(); if (!ri.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "receipt attempt");
+      auto rj = r.u64(); if (!rj.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "receipt gen");
+      auto rk = r.u64(); if (!rk.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "receipt dispatch");
+      auto la = r.u64(); if (!la.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "receipt cb");
+      auto lb = r.u64(); if (!lb.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "receipt ca");
+      auto lc = r.u64(); if (!lc.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "receipt pre");
+      auto ld = r.u64(); if (!ld.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "receipt post");
+      auto le = r.u64(); if (!le.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "receipt delta");
+      auto lf = r.u8(); if (!lf.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "receipt kind");
+      auto lg = r.u8(); if (!lg.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "receipt terminal");
+      auto lh = r.u32(); if (!lh.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "receipt token");
+      auto li = r.ns(); if (!li.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "receipt active");
+      auto lj = r.ns(); if (!lj.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "receipt time");
+      rp.receipt_id = ReceiptId::from(ra.value()); rp.grant_id = GrantId::from(rb.value());
+      rp.proposal = ProposalId::from(rc.value()); rp.epoch = CoordinatorEpoch::from(rd.value());
+      rp.worker = WorkerId::from(re.value()); rp.worker_boot = WorkerBootId::from(rf.value());
+      rp.sequence = SequenceId::from(rg.value()); rp.state = StateId::from(rh.value());
+      rp.attempt = AttemptId::from(ri.value()); rp.generation = DecodeGeneration::from(rj.value());
+      rp.dispatch = DispatchId::from(rk.value());
+      rp.committed_position_before = la.value(); rp.committed_position_after = lb.value();
+      rp.pre_state_digest = lc.value(); rp.post_state_digest = ld.value(); rp.delta_digest = le.value();
+      rp.outcome_kind = static_cast<MemberOutcomeKind>(lf.value()); rp.terminal = lg.value() != 0;
+      rp.token_identifier = lh.value(); rp.active_ns = li.value(); rp.committed_at = TimePoint(lj.value());
+      gr.receipt = std::move(rp);
+      gr.has_receipt = true;
+    }
+    impl_->grant_ledger[gr.grant.grant_id] = std::move(gr);
+  }
+  auto rcnt = r.u64(); if (!rcnt.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "receipt count");
+  impl_->receipt_count = rcnt.value();
   // Recompute derived/total counters from the restored sequences (the raw
   // aggregate counters are derived, never trusted from the wire).
   impl_->stats.generated_tokens = 0;

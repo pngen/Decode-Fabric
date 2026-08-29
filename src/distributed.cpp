@@ -149,7 +149,7 @@ Result<void> run_coordinator(DecodeFabric& fab, int listen_port, int max_loops, 
             std::lock_guard<std::mutex> lk(g_worker_mu);
             g_worker_conns[w.id] = sp;
           }
-          // Worker I/O loop: read ExecuteResults, detect death.
+          // Worker I/O loop: read PreparedResult / CommitReceipt, detect death.
           while (running) {
             auto next = sp->recv_frame();
             if (!next.ok()) {
@@ -159,9 +159,22 @@ Result<void> run_coordinator(DecodeFabric& fab, int listen_port, int max_loops, 
               break;
             }
             Frame f = next.value();
-            if (f.type == FrameType::ExecuteResult) {
-              auto res = decode_execute_result(f.payload);
-              if (res.ok()) (void)fab.apply_completion(res.value());
+            if (f.type == FrameType::PreparedResult) {
+              auto res = decode_prepared_result(f.payload);
+              if (res.ok()) {
+                auto auth = fab.authorize_prepared(res.value());
+                if (auth.ok()) {
+                  // Send a one-use commit grant (or an abort) back to the worker
+                  // over the same worker connection.
+                  for (const auto& ga : auth.value().members) {
+                    if (ga.has_grant) (void)sp->send_frame(FrameType::CommitGrant, encode_commit_grant(ga.grant));
+                    else if (ga.has_abort) (void)sp->send_frame(FrameType::AbortPrepared, encode_abort_prepared(ga.abort_spec));
+                  }
+                }
+              }
+            } else if (f.type == FrameType::CommitReceipt) {
+              auto rc = decode_commit_receipts(f.payload);
+              if (rc.ok()) (void)fab.apply_commit_receipt(rc.value());
             } else if (f.type == FrameType::Shutdown) {
               std::lock_guard<std::mutex> lk(g_worker_mu);
               g_worker_conns.erase(w.id);
@@ -351,17 +364,37 @@ int worker_main(int argc, char** argv) {
     if (!f.ok()) break;
     Frame fr = f.value();
     if (fr.type == FrameType::ExecuteRequest) {
+      // Prepare request: read-only on committed executor state.
       auto req = decode_execute_request(fr.payload);
       if (!req.ok()) { continue; }
-      auto res = ex->execute(req.value());
-      if (res.ok()) {
-        (void)conn.send_frame(FrameType::ExecuteResult, encode_execute_result(res.value()));
+      auto prep = ex->prepare(req.value());
+      if (prep.ok()) {
+        (void)conn.send_frame(FrameType::PreparedResult, encode_prepared_result(prep.value()));
       } else {
-        DecodeExecutionResult r;
-        r.dispatch_id = req.value().dispatch_id; r.epoch = req.value().epoch; r.worker = req.value().worker; r.worker_boot = req.value().worker_boot;
-        r.group_error = res.error().code; r.group_error_message = res.error().message;
-        (void)conn.send_frame(FrameType::ExecuteResult, encode_execute_result(r));
+        PreparedDecode p;
+        p.dispatch_id = req.value().dispatch_id; p.epoch = req.value().epoch;
+        p.worker = req.value().worker; p.worker_boot = req.value().worker_boot;
+        p.group_error = prep.error().code; p.group_error_message = prep.error().message;
+        (void)conn.send_frame(FrameType::PreparedResult, encode_prepared_result(p));
       }
+    } else if (fr.type == FrameType::CommitGrant) {
+      auto grant = decode_commit_grant(fr.payload);
+      if (!grant.ok()) continue;
+      auto cres = ex->commit(grant.value());
+      ReceiptDecode rd;
+      rd.dispatch_id = grant.value().dispatch;
+      rd.epoch = grant.value().epoch;
+      rd.worker = grant.value().worker;
+      rd.worker_boot = grant.value().worker_boot;
+      if (cres.ok()) {
+        MemberReceipt mr = std::move(cres.value());
+        mr.committed_at = TimePoint(0);
+        rd.receipts.push_back(std::move(mr));
+      }
+      (void)conn.send_frame(FrameType::CommitReceipt, encode_commit_receipts(rd));
+    } else if (fr.type == FrameType::AbortPrepared) {
+      auto ab = decode_abort_prepared(fr.payload);
+      if (ab.ok()) (void)ex->abort(ab.value());
     } else if (fr.type == FrameType::Shutdown) {
       (void)conn.send_frame(FrameType::WorkerShutdownAck, {});
       break;

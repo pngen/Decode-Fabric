@@ -121,6 +121,16 @@ using ClientId = Id<ClientIdTag>;
 struct SessionIdTag;
 using SessionId = Id<SessionIdTag>;
 
+// Executor state-transaction identities (one-use proposal, grant, receipt).
+struct ProposalIdTag;
+using ProposalId = Id<ProposalIdTag>;
+
+struct GrantIdTag;
+using GrantId = Id<GrantIdTag>;
+
+struct ReceiptIdTag;
+using ReceiptId = Id<ReceiptIdTag>;
+
 }  // namespace decodefabric
 
 // std::hash specializations for the concrete identifier types. These are
@@ -251,6 +261,24 @@ struct hash<decodefabric::ClientId> {
 template <>
 struct hash<decodefabric::SessionId> {
   std::size_t operator()(decodefabric::SessionId const& v) const noexcept {
+    return std::hash<std::uint64_t>{}(v.value());
+  }
+};
+template <>
+struct hash<decodefabric::ProposalId> {
+  std::size_t operator()(decodefabric::ProposalId const& v) const noexcept {
+    return std::hash<std::uint64_t>{}(v.value());
+  }
+};
+template <>
+struct hash<decodefabric::GrantId> {
+  std::size_t operator()(decodefabric::GrantId const& v) const noexcept {
+    return std::hash<std::uint64_t>{}(v.value());
+  }
+};
+template <>
+struct hash<decodefabric::ReceiptId> {
+  std::size_t operator()(decodefabric::ReceiptId const& v) const noexcept {
     return std::hash<std::uint64_t>{}(v.value());
   }
 };

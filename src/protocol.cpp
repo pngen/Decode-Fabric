@@ -433,4 +433,262 @@ Result<AuthorityReply> decode_authority_reply(const std::vector<std::uint8_t>& b
   return Result<AuthorityReply>::ok(a);
 }
 
+
+// ===========================================================================
+// Transactional executor-state protocol codecs
+// ===========================================================================
+static void write_outcome(Writer& w, const MemberOutcome& mo) {
+  w.u64(mo.sequence.value());
+  w.u8(static_cast<std::uint8_t>(mo.kind));
+  w.u64(mo.generated); w.u64(mo.token_identifier);
+  w.u8(mo.terminal ? 1 : 0);
+  w.u32(static_cast<std::uint32_t>(mo.error_code)); w.str(mo.error_message);
+  w.u8(mo.retryable ? 1 : 0);
+  w.ns(mo.started_at.ns); w.ns(mo.finished_at.ns); w.ns(mo.active_ns);
+  w.u64(mo.kv_bytes_delta); w.u64(mo.kv_bytes_after);
+  w.u64(mo.attempt.value()); w.u64(mo.generation.value());
+}
+
+static Result<MemberOutcome> read_outcome(Reader& r) {
+  MemberOutcome mo;
+  auto seq = r.u64(); if (!seq.ok()) return Result<MemberOutcome>{seq.error()};
+  auto k = r.u8(); if (!k.ok()) return Result<MemberOutcome>{k.error()};
+  auto gn = r.u64(); if (!gn.ok()) return Result<MemberOutcome>{gn.error()};
+  auto tid = r.u64(); if (!tid.ok()) return Result<MemberOutcome>{tid.error()};
+  auto te = r.u8(); if (!te.ok()) return Result<MemberOutcome>{te.error()};
+  auto ec = r.u32(); if (!ec.ok()) return Result<MemberOutcome>{ec.error()};
+  auto em = r.str(); if (!em.ok()) return Result<MemberOutcome>{em.error()};
+  auto rb = r.u8(); if (!rb.ok()) return Result<MemberOutcome>{rb.error()};
+  auto sa = r.ns(); if (!sa.ok()) return Result<MemberOutcome>{sa.error()};
+  auto fa = r.ns(); if (!fa.ok()) return Result<MemberOutcome>{fa.error()};
+  auto an = r.ns(); if (!an.ok()) return Result<MemberOutcome>{an.error()};
+  auto kd = r.u64(); if (!kd.ok()) return Result<MemberOutcome>{kd.error()};
+  auto ka = r.u64(); if (!ka.ok()) return Result<MemberOutcome>{ka.error()};
+  auto at = r.u64(); if (!at.ok()) return Result<MemberOutcome>{at.error()};
+  auto gr = r.u64(); if (!gr.ok()) return Result<MemberOutcome>{gr.error()};
+  mo.sequence = SequenceId::from(seq.value());
+  mo.kind = static_cast<MemberOutcomeKind>(k.value());
+  mo.generated = gn.value(); mo.token_identifier = tid.value();
+  mo.terminal = te.value() != 0;
+  mo.error_code = static_cast<ErrorCode>(ec.value()); mo.error_message = em.value();
+  mo.retryable = rb.value() != 0;
+  mo.started_at = TimePoint(sa.value()); mo.finished_at = TimePoint(fa.value());
+  mo.active_ns = an.value(); mo.kv_bytes_delta = kd.value(); mo.kv_bytes_after = ka.value();
+  mo.attempt = AttemptId::from(at.value()); mo.generation = DecodeGeneration::from(gr.value());
+  return Result<MemberOutcome>::ok(std::move(mo));
+}
+
+std::vector<std::uint8_t> encode_prepared_result(const PreparedDecode& res) {
+  Writer w;
+  w.u64(res.dispatch_id.value()); w.u64(res.epoch.value());
+  w.u64(res.worker.value()); w.u64(res.worker_boot.value());
+  w.ns(res.group_active_ns);
+  w.u32(static_cast<std::uint32_t>(res.group_error));
+  w.str(res.group_error_message);
+  w.u64(static_cast<std::uint64_t>(res.members.size()));
+  for (const PreparedMember& pm : res.members) {
+    w.u64(pm.sequence.value()); w.u64(pm.state.value()); w.u64(pm.attempt.value());
+    w.u64(pm.generation.value()); w.u64(pm.dispatch.value()); w.u64(pm.epoch.value());
+    w.u64(pm.worker.value()); w.u64(pm.worker_boot.value()); w.u64(pm.proposal.value());
+    w.u64(pm.pre_state_digest); w.u64(pm.post_state_digest); w.u64(pm.delta_digest);
+    w.u64(pm.committed_position_before); w.u64(pm.committed_position_after);
+    w.ns(pm.active_ns);
+    write_outcome(w, pm.outcome);
+  }
+  return w.take();
+}
+
+Result<PreparedDecode> decode_prepared_result(const std::vector<std::uint8_t>& bytes) {
+  Reader r(bytes);
+  PreparedDecode res;
+  auto did = r.u64(); if (!did.ok()) return Result<PreparedDecode>{did.error()};
+  auto ep = r.u64(); if (!ep.ok()) return Result<PreparedDecode>{ep.error()};
+  auto wk = r.u64(); if (!wk.ok()) return Result<PreparedDecode>{wk.error()};
+  auto wb = r.u64(); if (!wb.ok()) return Result<PreparedDecode>{wb.error()};
+  auto ga = r.ns(); if (!ga.ok()) return Result<PreparedDecode>{ga.error()};
+  auto ge = r.u32(); if (!ge.ok()) return Result<PreparedDecode>{ge.error()};
+  auto gem = r.str(); if (!gem.ok()) return Result<PreparedDecode>{gem.error()};
+  auto cnt = r.u64(); if (!cnt.ok()) return Result<PreparedDecode>{cnt.error()};
+  if (cnt.value() > 1u << 18) return Result<PreparedDecode>{Error{ErrorCode::ProtocolInvalidField, "prepared member count too large"}};
+  for (std::uint64_t i = 0; i < cnt.value(); ++i) {
+    PreparedMember pm;
+    auto a = r.u64(); if (!a.ok()) return Result<PreparedDecode>{a.error()};
+    auto b = r.u64(); if (!b.ok()) return Result<PreparedDecode>{b.error()};
+    auto c = r.u64(); if (!c.ok()) return Result<PreparedDecode>{c.error()};
+    auto d = r.u64(); if (!d.ok()) return Result<PreparedDecode>{d.error()};
+    auto e = r.u64(); if (!e.ok()) return Result<PreparedDecode>{e.error()};
+    auto f = r.u64(); if (!f.ok()) return Result<PreparedDecode>{f.error()};
+    auto g2 = r.u64(); if (!g2.ok()) return Result<PreparedDecode>{g2.error()};
+    auto h = r.u64(); if (!h.ok()) return Result<PreparedDecode>{h.error()};
+    auto pro = r.u64(); if (!pro.ok()) return Result<PreparedDecode>{pro.error()};
+    auto pre = r.u64(); if (!pre.ok()) return Result<PreparedDecode>{pre.error()};
+    auto post = r.u64(); if (!post.ok()) return Result<PreparedDecode>{post.error()};
+    auto dd = r.u64(); if (!dd.ok()) return Result<PreparedDecode>{dd.error()};
+    auto cb = r.u64(); if (!cb.ok()) return Result<PreparedDecode>{cb.error()};
+    auto ca = r.u64(); if (!ca.ok()) return Result<PreparedDecode>{ca.error()};
+    auto an = r.ns(); if (!an.ok()) return Result<PreparedDecode>{an.error()};
+    auto oc = read_outcome(r); if (!oc.ok()) return Result<PreparedDecode>{oc.error()};
+    pm.sequence = SequenceId::from(a.value()); pm.state = StateId::from(b.value());
+    pm.attempt = AttemptId::from(c.value()); pm.generation = DecodeGeneration::from(d.value());
+    pm.dispatch = DispatchId::from(e.value()); pm.epoch = CoordinatorEpoch::from(f.value());
+    pm.worker = WorkerId::from(g2.value()); pm.worker_boot = WorkerBootId::from(h.value());
+    pm.proposal = ProposalId::from(pro.value());
+    pm.pre_state_digest = pre.value(); pm.post_state_digest = post.value(); pm.delta_digest = dd.value();
+    pm.committed_position_before = cb.value(); pm.committed_position_after = ca.value();
+    pm.active_ns = an.value(); pm.outcome = std::move(oc.value());
+    res.members.push_back(std::move(pm));
+  }
+  res.dispatch_id = DispatchId::from(did.value()); res.epoch = CoordinatorEpoch::from(ep.value());
+  res.worker = WorkerId::from(wk.value()); res.worker_boot = WorkerBootId::from(wb.value());
+  res.group_active_ns = ga.value(); res.group_error = static_cast<ErrorCode>(ge.value());
+  res.group_error_message = gem.value();
+  return Result<PreparedDecode>::ok(std::move(res));
+}
+
+std::vector<std::uint8_t> encode_commit_grant(const CommitGrant& g) {
+  Writer w;
+  w.u64(g.grant_id.value()); w.u64(g.proposal.value());
+  w.u64(g.epoch.value()); w.u64(g.worker.value()); w.u64(g.worker_boot.value());
+  w.u64(g.sequence.value()); w.u64(g.state.value()); w.u64(g.attempt.value());
+  w.u64(g.generation.value()); w.u64(g.dispatch.value());
+  w.u64(g.committed_position);
+  w.u64(g.pre_state_digest); w.u64(g.post_state_digest); w.u64(g.delta_digest);
+  w.u8(static_cast<std::uint8_t>(g.outcome_kind)); w.u8(g.terminal ? 1 : 0);
+  w.u32(g.token_identifier); w.ns(g.active_ns);
+  return w.take();
+}
+
+Result<CommitGrant> decode_commit_grant(const std::vector<std::uint8_t>& bytes) {
+  Reader r(bytes);
+  CommitGrant g;
+  auto gid = r.u64(); if (!gid.ok()) return Result<CommitGrant>{gid.error()};
+  auto pro = r.u64(); if (!pro.ok()) return Result<CommitGrant>{pro.error()};
+  auto ep = r.u64(); if (!ep.ok()) return Result<CommitGrant>{ep.error()};
+  auto wk = r.u64(); if (!wk.ok()) return Result<CommitGrant>{wk.error()};
+  auto wb = r.u64(); if (!wb.ok()) return Result<CommitGrant>{wb.error()};
+  auto sq = r.u64(); if (!sq.ok()) return Result<CommitGrant>{sq.error()};
+  auto st = r.u64(); if (!st.ok()) return Result<CommitGrant>{st.error()};
+  auto at = r.u64(); if (!at.ok()) return Result<CommitGrant>{at.error()};
+  auto gn = r.u64(); if (!gn.ok()) return Result<CommitGrant>{gn.error()};
+  auto di = r.u64(); if (!di.ok()) return Result<CommitGrant>{di.error()};
+  auto cp = r.u64(); if (!cp.ok()) return Result<CommitGrant>{cp.error()};
+  auto pre = r.u64(); if (!pre.ok()) return Result<CommitGrant>{pre.error()};
+  auto post = r.u64(); if (!post.ok()) return Result<CommitGrant>{post.error()};
+  auto dd = r.u64(); if (!dd.ok()) return Result<CommitGrant>{dd.error()};
+  auto ok = r.u8(); if (!ok.ok()) return Result<CommitGrant>{ok.error()};
+  auto term = r.u8(); if (!term.ok()) return Result<CommitGrant>{term.error()};
+  auto tok = r.u32(); if (!tok.ok()) return Result<CommitGrant>{tok.error()};
+  auto an = r.ns(); if (!an.ok()) return Result<CommitGrant>{an.error()};
+  g.grant_id = GrantId::from(gid.value()); g.proposal = ProposalId::from(pro.value());
+  g.epoch = CoordinatorEpoch::from(ep.value()); g.worker = WorkerId::from(wk.value());
+  g.worker_boot = WorkerBootId::from(wb.value()); g.sequence = SequenceId::from(sq.value());
+  g.state = StateId::from(st.value()); g.attempt = AttemptId::from(at.value());
+  g.generation = DecodeGeneration::from(gn.value()); g.dispatch = DispatchId::from(di.value());
+  g.committed_position = cp.value(); g.pre_state_digest = pre.value();
+  g.post_state_digest = post.value(); g.delta_digest = dd.value();
+  g.outcome_kind = static_cast<MemberOutcomeKind>(ok.value()); g.terminal = term.value() != 0;
+  g.token_identifier = tok.value(); g.active_ns = an.value();
+  return Result<CommitGrant>::ok(std::move(g));
+}
+
+std::vector<std::uint8_t> encode_commit_receipts(const ReceiptDecode& res) {
+  Writer w;
+  w.u64(res.dispatch_id.value()); w.u64(res.epoch.value());
+  w.u64(res.worker.value()); w.u64(res.worker_boot.value());
+  w.u32(static_cast<std::uint32_t>(res.group_error));
+  w.str(res.group_error_message);
+  w.u64(static_cast<std::uint64_t>(res.receipts.size()));
+  for (const MemberReceipt& rec : res.receipts) {
+    w.u64(rec.receipt_id.value()); w.u64(rec.grant_id.value()); w.u64(rec.proposal.value());
+    w.u64(rec.epoch.value()); w.u64(rec.worker.value()); w.u64(rec.worker_boot.value());
+    w.u64(rec.sequence.value()); w.u64(rec.state.value()); w.u64(rec.attempt.value());
+    w.u64(rec.generation.value()); w.u64(rec.dispatch.value());
+    w.u64(rec.committed_position_before); w.u64(rec.committed_position_after);
+    w.u64(rec.pre_state_digest); w.u64(rec.post_state_digest); w.u64(rec.delta_digest);
+    w.u8(static_cast<std::uint8_t>(rec.outcome_kind)); w.u8(rec.terminal ? 1 : 0);
+    w.u32(rec.token_identifier); w.ns(rec.active_ns); w.ns(rec.committed_at.ns);
+  }
+  return w.take();
+}
+
+Result<ReceiptDecode> decode_commit_receipts(const std::vector<std::uint8_t>& bytes) {
+  Reader r(bytes);
+  ReceiptDecode res;
+  auto did = r.u64(); if (!did.ok()) return Result<ReceiptDecode>{did.error()};
+  auto ep = r.u64(); if (!ep.ok()) return Result<ReceiptDecode>{ep.error()};
+  auto wk = r.u64(); if (!wk.ok()) return Result<ReceiptDecode>{wk.error()};
+  auto wb = r.u64(); if (!wb.ok()) return Result<ReceiptDecode>{wb.error()};
+  auto ge = r.u32(); if (!ge.ok()) return Result<ReceiptDecode>{ge.error()};
+  auto gem = r.str(); if (!gem.ok()) return Result<ReceiptDecode>{gem.error()};
+  auto cnt = r.u64(); if (!cnt.ok()) return Result<ReceiptDecode>{cnt.error()};
+  if (cnt.value() > 1u << 18) return Result<ReceiptDecode>{Error{ErrorCode::ProtocolInvalidField, "receipt count too large"}};
+  for (std::uint64_t i = 0; i < cnt.value(); ++i) {
+    MemberReceipt rec;
+    auto a = r.u64(); if (!a.ok()) return Result<ReceiptDecode>{a.error()};
+    auto b = r.u64(); if (!b.ok()) return Result<ReceiptDecode>{b.error()};
+    auto c = r.u64(); if (!c.ok()) return Result<ReceiptDecode>{c.error()};
+    auto d = r.u64(); if (!d.ok()) return Result<ReceiptDecode>{d.error()};
+    auto e = r.u64(); if (!e.ok()) return Result<ReceiptDecode>{e.error()};
+    auto f = r.u64(); if (!f.ok()) return Result<ReceiptDecode>{f.error()};
+    auto g2 = r.u64(); if (!g2.ok()) return Result<ReceiptDecode>{g2.error()};
+    auto h = r.u64(); if (!h.ok()) return Result<ReceiptDecode>{h.error()};
+    auto i2 = r.u64(); if (!i2.ok()) return Result<ReceiptDecode>{i2.error()};
+    auto j = r.u64(); if (!j.ok()) return Result<ReceiptDecode>{j.error()};
+    auto k = r.u64(); if (!k.ok()) return Result<ReceiptDecode>{k.error()};
+    auto cb = r.u64(); if (!cb.ok()) return Result<ReceiptDecode>{cb.error()};
+    auto ca = r.u64(); if (!ca.ok()) return Result<ReceiptDecode>{ca.error()};
+    auto pre = r.u64(); if (!pre.ok()) return Result<ReceiptDecode>{pre.error()};
+    auto post = r.u64(); if (!post.ok()) return Result<ReceiptDecode>{post.error()};
+    auto dd = r.u64(); if (!dd.ok()) return Result<ReceiptDecode>{dd.error()};
+    auto ok = r.u8(); if (!ok.ok()) return Result<ReceiptDecode>{ok.error()};
+    auto term = r.u8(); if (!term.ok()) return Result<ReceiptDecode>{term.error()};
+    auto tok = r.u32(); if (!tok.ok()) return Result<ReceiptDecode>{tok.error()};
+    auto an = r.ns(); if (!an.ok()) return Result<ReceiptDecode>{an.error()};
+    auto cat = r.ns(); if (!cat.ok()) return Result<ReceiptDecode>{cat.error()};
+    rec.receipt_id = ReceiptId::from(a.value()); rec.grant_id = GrantId::from(b.value());
+    rec.proposal = ProposalId::from(c.value()); rec.epoch = CoordinatorEpoch::from(d.value());
+    rec.worker = WorkerId::from(e.value()); rec.worker_boot = WorkerBootId::from(f.value());
+    rec.sequence = SequenceId::from(g2.value()); rec.state = StateId::from(h.value());
+    rec.attempt = AttemptId::from(i2.value()); rec.generation = DecodeGeneration::from(j.value());
+    rec.dispatch = DispatchId::from(k.value());
+    rec.committed_position_before = cb.value(); rec.committed_position_after = ca.value();
+    rec.pre_state_digest = pre.value(); rec.post_state_digest = post.value(); rec.delta_digest = dd.value();
+    rec.outcome_kind = static_cast<MemberOutcomeKind>(ok.value()); rec.terminal = term.value() != 0;
+    rec.token_identifier = tok.value(); rec.active_ns = an.value(); rec.committed_at = TimePoint(cat.value());
+    res.receipts.push_back(std::move(rec));
+  }
+  res.dispatch_id = DispatchId::from(did.value()); res.epoch = CoordinatorEpoch::from(ep.value());
+  res.worker = WorkerId::from(wk.value()); res.worker_boot = WorkerBootId::from(wb.value());
+  res.group_error = static_cast<ErrorCode>(ge.value()); res.group_error_message = gem.value();
+  return Result<ReceiptDecode>::ok(std::move(res));
+}
+
+std::vector<std::uint8_t> encode_abort_prepared(const AbortPrepared& a) {
+  Writer w;
+  w.u64(a.proposal.value()); w.u64(a.sequence.value()); w.u64(a.state.value());
+  w.u64(a.attempt.value()); w.u64(a.generation.value()); w.u64(a.dispatch.value());
+  w.u64(a.epoch.value()); w.u64(a.worker.value()); w.u64(a.worker_boot.value());
+  return w.take();
+}
+
+Result<AbortPrepared> decode_abort_prepared(const std::vector<std::uint8_t>& bytes) {
+  Reader r(bytes);
+  AbortPrepared a;
+  auto pro = r.u64(); if (!pro.ok()) return Result<AbortPrepared>{pro.error()};
+  auto sq = r.u64(); if (!sq.ok()) return Result<AbortPrepared>{sq.error()};
+  auto st = r.u64(); if (!st.ok()) return Result<AbortPrepared>{st.error()};
+  auto at = r.u64(); if (!at.ok()) return Result<AbortPrepared>{at.error()};
+  auto gn = r.u64(); if (!gn.ok()) return Result<AbortPrepared>{gn.error()};
+  auto di = r.u64(); if (!di.ok()) return Result<AbortPrepared>{di.error()};
+  auto ep = r.u64(); if (!ep.ok()) return Result<AbortPrepared>{ep.error()};
+  auto wk = r.u64(); if (!wk.ok()) return Result<AbortPrepared>{wk.error()};
+  auto wb = r.u64(); if (!wb.ok()) return Result<AbortPrepared>{wb.error()};
+  a.proposal = ProposalId::from(pro.value()); a.sequence = SequenceId::from(sq.value());
+  a.state = StateId::from(st.value()); a.attempt = AttemptId::from(at.value());
+  a.generation = DecodeGeneration::from(gn.value()); a.dispatch = DispatchId::from(di.value());
+  a.epoch = CoordinatorEpoch::from(ep.value()); a.worker = WorkerId::from(wk.value());
+  a.worker_boot = WorkerBootId::from(wb.value());
+  return Result<AbortPrepared>::ok(std::move(a));
+}
+
 }  // namespace decodefabric::protocol

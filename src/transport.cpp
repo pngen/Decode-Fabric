@@ -19,14 +19,14 @@ static int ensure_winsock() {
 static SOCKET from_void(void* p) { return reinterpret_cast<SOCKET>(p); }
 static void* to_void(SOCKET s) { return reinterpret_cast<void*>(s); }
 
-TcpConnection::TcpConnection() : socket_(to_void(INVALID_SOCKET)) {}
+TcpConnection::TcpConnection() : socket_(to_void(INVALID_SOCKET)), send_mu_(std::make_shared<std::mutex>()) {}
 TcpConnection::~TcpConnection() { close(); }
 TcpConnection::TcpConnection(TcpConnection&& o) noexcept
-    : socket_(o.socket_), decoder_(std::move(o.decoder_)), recv_buf_(std::move(o.recv_buf_)), last_error_(o.last_error_) {
+    : socket_(o.socket_), decoder_(std::move(o.decoder_)), recv_buf_(std::move(o.recv_buf_)), last_error_(o.last_error_), send_mu_(std::make_shared<std::mutex>()) {
   o.socket_ = to_void(INVALID_SOCKET);
 }
 TcpConnection& TcpConnection::operator=(TcpConnection&& o) noexcept {
-  if (this != &o) { close(); socket_ = o.socket_; decoder_ = std::move(o.decoder_); recv_buf_ = std::move(o.recv_buf_); last_error_ = o.last_error_; o.socket_ = to_void(INVALID_SOCKET); }
+  if (this != &o) { close(); socket_ = o.socket_; decoder_ = std::move(o.decoder_); recv_buf_ = std::move(o.recv_buf_); last_error_ = o.last_error_; send_mu_ = std::make_shared<std::mutex>(); o.socket_ = to_void(INVALID_SOCKET); }
   return *this;
 }
 void TcpConnection::close() {
@@ -63,6 +63,7 @@ Result<void> TcpConnection::set_nonblocking(bool on) {
 }
 
 Result<void> TcpConnection::send_frame(protocol::FrameType type, const std::vector<std::uint8_t>& payload) {
+  std::lock_guard<std::mutex> send_lk(*(send_mu_ ? send_mu_ : (send_mu_ = std::make_shared<std::mutex>())));
   SOCKET s = from_void(socket_);
   if (s == INVALID_SOCKET) return failed<void>(ErrorCode::BackendError, "not connected");
   std::vector<std::uint8_t> frame = protocol::encode_frame(type, payload);

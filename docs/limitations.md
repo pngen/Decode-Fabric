@@ -30,3 +30,21 @@ here as limitations; this lists only what is genuinely out of scope or bounded.
 - **Persistence is snapshot-based.** Recovery reconstructs state from a
   versioned, checksummed snapshot and reconciles formerly-running remote work by
   re-queuing; it does not provide a distributed shared-state store.
+- **Executor-resident state is process-local.** Committed executor state (CPU
+  recurrent vectors, CUDA device buffers) is never persisted. A worker or
+  coordinator restart destroys it. Recovery therefore invalidates any pending
+  commit grant (a grant from the old epoch/worker boot is never revived) and
+  re-dispatches the sequence from its unchanged committed pre-state under fresh
+  authority. For the shipped synthetic executor the deterministic
+  reconstruction contract is exactly: re-initialize the recurrent state from the
+  sequence identity/attempt and step forward the receipt chain from the
+  committed pre-state digest. A real model/KV executor must provide its own
+  reconstruction contract at the same boundary.
+- **State digests are per-backend.** CPU and CUDA produce different digest values
+  (different numeric representations). A receipt-chain is only meaningful within
+  one backend/device; across a restart the reconstruction contract re-derives it.
+- **Transactional extra round trip (distributed).** The real distributed path
+  performs prepare -> authorize -> commit -> receipt (a prepare-response and a
+  commit-response over framed TCP) rather than a single execute->complete round
+  trip. This adds one network round trip per decode step; it is measured rather
+  than claimed to be free.

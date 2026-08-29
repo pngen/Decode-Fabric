@@ -93,6 +93,12 @@ struct DecodeExecutionRequest {
 };
 
 // --- Decode execution result ------------------------------------------------
+// Retained for the pre-transactional completion path (e.g. a stale-replay
+// artifact or a non-transactional backend error). Transactional workloads
+// produce PreparedDecode / CommitGrant / MemberReceipt instead. A
+// DecodeExecutionResult member outcome is never itself authoritative for a
+// state transition: it either reflects a rejected/stale step or is folded into
+// a receipt.
 struct DecodeExecutionResult {
   DispatchId dispatch_id;
   // Authority under which the dispatch ran (used for stale-authority validation).
@@ -106,13 +112,138 @@ struct DecodeExecutionResult {
   bool group_retryable = false;
 };
 
+// --- Executor state transaction types --------------------------------------
+// The executor holds, per StateId, a committed state and (while a transaction
+// is in flight) a tentative/prepared state. A decode generation becomes
+// authoritative only when the transition prepared from the current committed
+// pre-state is authorized under current sequence/worker authority, committed
+// exactly once, and bound by a receipt whose post-state becomes the next
+// generation's pre-state.
+
+// A single prepared, not-yet-committed member transition.
+struct PreparedMember {
+  SequenceId sequence;
+  StateId state;
+  AttemptId attempt;
+  DecodeGeneration generation;
+  DispatchId dispatch;
+  CoordinatorEpoch epoch;
+  WorkerId worker;
+  WorkerBootId worker_boot;
+  ProposalId proposal;          // unique one-use proposal/preparation identity
+  std::uint64_t pre_state_digest = 0;   // digest of committed state before step
+  std::uint64_t post_state_digest = 0;  // digest of proposed state after step
+  std::uint64_t delta_digest = 0;       // optional deterministic transition digest
+  MemberOutcome outcome;        // proposed outcome (token / terminal / kv)
+  std::uint64_t committed_position_before = 0;  // authoritative committed-token index
+  std::uint64_t committed_position_after = 0;   // index after this step
+  Nanoseconds active_ns = 0;    // measured prepare (backend) time
+
+  bool is_commit_eligible() const noexcept {
+    return outcome.succeeded();
+  }
+};
+
+// The result of one group-level prepare: an ordered set of per-member prepared
+// transitions, one for each member of the dispatched group.
+struct PreparedDecode {
+  DispatchId dispatch_id;
+  CoordinatorEpoch epoch;
+  WorkerId worker;
+  WorkerBootId worker_boot;
+  std::vector<PreparedMember> members;
+  Nanoseconds group_active_ns = 0;
+  ErrorCode group_error = ErrorCode::Ok;
+  std::string group_error_message;
+};
+
+// A one-use commit grant. Issued by Decode Fabric only after full authority
+// validation of the corresponding prepared transition. Bound to the complete
+// authority/proposal tuple so it cannot be reused or applied to a different
+// sequence, worker boot, epoch, attempt, generation, dispatch, or pre-state.
+struct CommitGrant {
+  GrantId grant_id;
+  ProposalId proposal;
+  CoordinatorEpoch epoch;
+  WorkerId worker;
+  WorkerBootId worker_boot;
+  SequenceId sequence;
+  StateId state;
+  AttemptId attempt;
+  DecodeGeneration generation;
+  DispatchId dispatch;
+  std::uint64_t committed_position = 0;  // authoritative committed-token index
+  std::uint64_t pre_state_digest = 0;
+  std::uint64_t post_state_digest = 0;
+  std::uint64_t delta_digest = 0;
+  // Outcome metadata bound to the transition (for finalization).
+  MemberOutcomeKind outcome_kind = MemberOutcomeKind::StepSuccessContinue;
+  bool terminal = false;
+  std::uint32_t token_identifier = 0;
+  Nanoseconds active_ns = 0;
+};
+
+// The deterministic commit receipt binding a committed transition.
+struct MemberReceipt {
+  ReceiptId receipt_id;
+  GrantId grant_id;
+  ProposalId proposal;
+  CoordinatorEpoch epoch;
+  WorkerId worker;
+  WorkerBootId worker_boot;
+  SequenceId sequence;
+  StateId state;
+  AttemptId attempt;
+  DecodeGeneration generation;
+  DispatchId dispatch;
+  std::uint64_t committed_position_before = 0;
+  std::uint64_t committed_position_after = 0;
+  std::uint64_t pre_state_digest = 0;
+  std::uint64_t post_state_digest = 0;
+  std::uint64_t delta_digest = 0;
+  MemberOutcomeKind outcome_kind = MemberOutcomeKind::StepSuccessContinue;
+  bool terminal = false;
+  std::uint32_t token_identifier = 0;
+  Nanoseconds active_ns = 0;
+  TimePoint committed_at;                 // timestamp metadata
+};
+
+// A group-level decode result: per-member receipts for members that committed.
+struct ReceiptDecode {
+  DispatchId dispatch_id;
+  CoordinatorEpoch epoch;
+  WorkerId worker;
+  WorkerBootId worker_boot;
+  std::vector<MemberReceipt> receipts;
+  ErrorCode group_error = ErrorCode::Ok;
+  std::string group_error_message;
+};
+
+// An explicit abort/discard of a prepared (but never committed) transition.
+struct AbortPrepared {
+  ProposalId proposal;
+  SequenceId sequence;
+  StateId state;
+  AttemptId attempt;
+  DecodeGeneration generation;
+  DispatchId dispatch;
+  CoordinatorEpoch epoch;
+  WorkerId worker;
+  WorkerBootId worker_boot;
+};
+
 // --- Executor contract ------------------------------------------------------
 // A DecodeExecutor executes exactly one authoritative decode iteration (one
-// "quantum") for a packed group of compatible sequences. Implementations may
-// process the group as a single backend call. Members keep independent
-// outcomes. The interface is synchronous: the caller (scheduler on a worker
-// thread, or a worker process over the control plane) decides how to schedule
-// the call.
+// "quantum") for a packed group of compatible sequences, but through a
+// transactional state protocol: prepare (read-only), then commit (on a one-use
+// grant) or abort. Implementations may process the group as a single backend
+// call. Members keep independent outcomes. Implementations are synchronous; the
+// caller (scheduler on a worker thread, or a worker process over the control
+// plane) decides how to schedule the call.
+//
+// The fundamental invariant: NO executor-resident state transition becomes
+// committed/durable unless it is authorized by the exact current Decode Fabric
+// authority for that sequence step.
 class DecodeExecutor {
  public:
   virtual ~DecodeExecutor() = default;
@@ -124,10 +255,24 @@ class DecodeExecutor {
   // Whether this executor can run a request with the given key.
   virtual bool supports(const CompatibilityKey& key) const = 0;
 
-  // Execute one authoritative iterate. Must return a per-member outcome for
-  // each member and must not advance anything on its own: advancement is the
-  // sole responsibility of the fabric, which applies outcome semantics.
-  virtual Result<DecodeExecutionResult> execute(const DecodeExecutionRequest& req) = 0;
+  // Prepare phase. Reads ONLY the current committed state, computes the
+  // proposed next step into tentative storage, leaves committed state
+  // unchanged, and returns one PreparedMember per input member. Must not
+  // silently overwrite an unresolved prepared transition for the same
+  // authoritative sequence generation (it should reject it instead).
+  virtual Result<PreparedDecode> prepare(const DecodeExecutionRequest& req) = 0;
+
+  // Commit phase. Receives one one-use commit grant, locates the exact prepared
+  // transition, verifies proposal + pre/post digests + full grant binding, then
+  // atomically promotes tentative -> committed, marks the proposal and grant
+  // consumed, and returns a receipt. Duplicate use of an already-consumed grant
+  // is idempotent (returns the existing receipt when identity matches exactly)
+  // and never applies the transition twice.
+  virtual Result<MemberReceipt> commit(const CommitGrant& grant) = 0;
+
+  // Abort phase. Discards the matching prepared transition (and any
+  // associated tentative resources). Committed state is unchanged.
+  virtual Result<void> abort(const AbortPrepared& abort) = 0;
 
   // Best-effort cancellation of in-flight work. The required safe boundary is
   // between decode iterations; implementations that cannot interrupt a kernel

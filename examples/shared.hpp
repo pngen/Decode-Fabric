@@ -29,4 +29,24 @@ inline decodefabric::DecodeRequest req(std::uint64_t id, std::uint64_t seq, std:
   r.state.estimated_growth = 64;
   return r;
 }
+// Drive one dispatched group through the transactional executor-state
+// protocol (prepare -> authorize -> commit/abort -> apply_commit_receipt).
+inline void drive(decodefabric::DecodeFabric& fab, decodefabric::DecodeExecutor& dcex,
+                  const decodefabric::Dispatch& d) {
+  decodefabric::DecodeExecutionRequest q;
+  q.dispatch_id = d.id; q.epoch = d.epoch; q.worker = d.worker; q.worker_boot = d.worker_boot;
+  q.key = d.key; q.device = d.device; q.reservation_id = d.reservation.value(); q.members = d.members;
+  { std::string k = d.key.to_string(); q.group_payload.assign(k.begin(), k.end()); }
+  auto prep = dcex.prepare(q);
+  if (!prep.ok()) return;
+  auto auth = fab.authorize_prepared(prep.value());
+  if (!auth.ok()) return;
+  decodefabric::ReceiptDecode rd;
+  rd.dispatch_id = d.id; rd.epoch = d.epoch; rd.worker = d.worker; rd.worker_boot = d.worker_boot;
+  for (const auto& ga : auth.value().members) {
+    if (ga.has_grant) { auto cr = dcex.commit(ga.grant); if (cr.ok()) rd.receipts.push_back(cr.value()); }
+    else if (ga.has_abort) (void)dcex.abort(ga.abort_spec);
+  }
+  (void)fab.apply_commit_receipt(rd);
+}
 }  // namespace ex

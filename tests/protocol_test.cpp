@@ -176,3 +176,98 @@ DF_TEST(status_query_roundtrip) {
   CHECK(d.value().active == 4);
   CHECK(d.value().generated_tokens == 100);
 }
+DF_TEST(prepared_result_roundtrip) {
+  auto req = make_exec_req();
+  PreparedDecode p;
+  p.dispatch_id = req.dispatch_id; p.epoch = req.epoch; p.worker = req.worker;
+  p.worker_boot = req.worker_boot; p.group_active_ns = 900; p.group_error = ErrorCode::Ok;
+  PreparedMember pm;
+  pm.sequence = req.members[0].sequence; pm.state = req.members[0].state.id;
+  pm.attempt = req.members[0].attempt; pm.generation = req.members[0].generation;
+  pm.dispatch = req.dispatch_id; pm.epoch = req.epoch; pm.worker = req.worker;
+  pm.worker_boot = req.worker_boot; pm.proposal = ProposalId::from(1234);
+  pm.pre_state_digest = 0xAAAA1111; pm.post_state_digest = 0xBBBB2222;
+  pm.delta_digest = 0xCCCC3333; pm.committed_position_before = 6; pm.committed_position_after = 7;
+  pm.active_ns = 850;
+  pm.outcome.sequence = req.members[0].sequence;
+  pm.outcome.kind = MemberOutcomeKind::StepSuccessContinue;
+  pm.outcome.generated = 1; pm.outcome.token_identifier = 88; pm.outcome.terminal = false;
+  pm.outcome.attempt = req.members[0].attempt; pm.outcome.generation = req.members[0].generation;
+  pm.outcome.kv_bytes_delta = 64; pm.outcome.kv_bytes_after = 128; pm.outcome.active_ns = 850;
+  p.members.push_back(pm);
+  auto bytes = encode_prepared_result(p);
+  auto out = decode_prepared_result(bytes);
+  CHECK(out.ok());
+  const auto& d = out.value();
+  CHECK(d.dispatch_id == p.dispatch_id);
+  CHECK(d.members.size() == 1);
+  CHECK(d.members[0].proposal == ProposalId::from(1234));
+  CHECK(d.members[0].pre_state_digest == 0xAAAA1111);
+  CHECK(d.members[0].post_state_digest == 0xBBBB2222);
+  CHECK(d.members[0].committed_position_before == 6);
+  CHECK(d.members[0].committed_position_after == 7);
+  CHECK(d.members[0].outcome.token_identifier == 88);
+  CHECK(d.members[0].outcome.kind == MemberOutcomeKind::StepSuccessContinue);
+}
+
+DF_TEST(commit_grant_and_receipt_roundtrip) {
+  CommitGrant g;
+  g.grant_id = GrantId::from(55); g.proposal = ProposalId::from(66);
+  g.epoch = CoordinatorEpoch::from(1); g.worker = WorkerId::from(1);
+  g.worker_boot = WorkerBootId::from(2); g.sequence = SequenceId::from(3);
+  g.state = StateId::from(4); g.attempt = AttemptId::from(5);
+  g.generation = DecodeGeneration::from(6); g.dispatch = DispatchId::from(7);
+  g.committed_position = 8; g.pre_state_digest = 9; g.post_state_digest = 10;
+  g.delta_digest = 11; g.outcome_kind = MemberOutcomeKind::StepSuccessContinue;
+  g.terminal = false; g.token_identifier = 12; g.active_ns = 13;
+  auto gb = encode_commit_grant(g);
+  auto go = decode_commit_grant(gb);
+  CHECK(go.ok());
+  CHECK(go.value().grant_id == GrantId::from(55));
+  CHECK(go.value().proposal == ProposalId::from(66));
+  CHECK(go.value().sequence == SequenceId::from(3));
+  CHECK(go.value().worker_boot == WorkerBootId::from(2));
+  CHECK(go.value().pre_state_digest == 9);
+  CHECK(go.value().post_state_digest == 10);
+  CHECK(go.value().token_identifier == 12);
+
+  ReceiptDecode rd;
+  rd.dispatch_id = DispatchId::from(7); rd.epoch = CoordinatorEpoch::from(1);
+  rd.worker = WorkerId::from(1); rd.worker_boot = WorkerBootId::from(2);
+  MemberReceipt rec;
+  rec.receipt_id = ReceiptId::from(77); rec.grant_id = GrantId::from(55);
+  rec.proposal = ProposalId::from(66); rec.epoch = CoordinatorEpoch::from(1);
+  rec.worker = WorkerId::from(1); rec.worker_boot = WorkerBootId::from(2);
+  rec.sequence = SequenceId::from(3); rec.state = StateId::from(4);
+  rec.attempt = AttemptId::from(5); rec.generation = DecodeGeneration::from(6);
+  rec.dispatch = DispatchId::from(7); rec.committed_position_before = 8;
+  rec.committed_position_after = 9; rec.pre_state_digest = 10;
+  rec.post_state_digest = 11; rec.delta_digest = 12;
+  rec.outcome_kind = MemberOutcomeKind::StepSuccessContinue; rec.terminal = false;
+  rec.token_identifier = 13; rec.active_ns = 14; rec.committed_at = TimePoint(15);
+  rd.receipts.push_back(rec);
+  auto rb = encode_commit_receipts(rd);
+  auto ro = decode_commit_receipts(rb);
+  CHECK(ro.ok());
+  CHECK(ro.value().receipts.size() == 1);
+  CHECK(ro.value().receipts[0].receipt_id == ReceiptId::from(77));
+  CHECK(ro.value().receipts[0].committed_position_after == 9);
+  CHECK(ro.value().receipts[0].committed_at.ns == 15);
+}
+
+DF_TEST(abort_prepared_roundtrip) {
+  AbortPrepared a;
+  a.proposal = ProposalId::from(10); a.sequence = SequenceId::from(11);
+  a.state = StateId::from(12); a.attempt = AttemptId::from(13);
+  a.generation = DecodeGeneration::from(14); a.dispatch = DispatchId::from(15);
+  a.epoch = CoordinatorEpoch::from(16); a.worker = WorkerId::from(17);
+  a.worker_boot = WorkerBootId::from(18);
+  auto b = encode_abort_prepared(a);
+  auto o = decode_abort_prepared(b);
+  CHECK(o.ok());
+  CHECK(o.value().proposal == ProposalId::from(10));
+  CHECK(o.value().sequence == SequenceId::from(11));
+  CHECK(o.value().generation == DecodeGeneration::from(14));
+  CHECK(o.value().worker_boot == WorkerBootId::from(18));
+}
+

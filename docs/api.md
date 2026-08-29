@@ -32,11 +32,19 @@ exceptions.
 
 ## Executors
 
-- DecodeExecutor contract with DecodeExecutionRequest / DecodeExecutionResult /
-  MemberOutcome (independent per-member outcomes).
-- CpuDecodeExecutor: deterministic stateful CPU decode.
-- CudaDecodeExecutor: real CUDA decode (sm_120 / RTX 5090), selected only when
-  the CUDA backend is enabled.
+- DecodeExecutor transactional contract: prepare(DecodeExecutionRequest) ->
+  PreparedDecode (one PreparedMember per member), commit(CommitGrant) ->
+  MemberReceipt, abort(AbortPrepared). Member outcomes are independent per member.
+- PreparedMember / PreparedDecode / CommitGrant / MemberReceipt / AbortPrepared:
+  the one-use proposal/grant/receipt identities, the full authority tuple, the
+  pre/post state digests, and the committed-token position indices.
+- DecodeExecutionRequest / DecodeExecutionResult / MemberOutcome retained for the
+  non-commit outcome path and the stale-replay artifact path.
+- CpuDecodeExecutor: deterministic stateful CPU decode with committed + tentative
+  state and deterministic state digests.
+- CudaDecodeExecutor: real CUDA decode (sm_120 / RTX 5090) with a committed and
+  a separate tentative device buffer, selected only when the CUDA backend is
+  enabled.
 
 ## State & memory
 
@@ -46,7 +54,8 @@ exceptions.
 ## Distributed
 
 - protocol::Frame / FrameDecoder (framed TCP, strict validation).
-- protocol message (de)serialization: execute request/result, submit request,
+- protocol message (de)serialization: execute request/result, prepared result,
+  commit grant, commit receipt, abort prepared, submit request,
   status/snapshot/explain/authority/epoch. 64-bit ids are carried as raw 64-bit
   integers, never through floating point.
 - transport::TcpConnection / TcpListener (Winsock).

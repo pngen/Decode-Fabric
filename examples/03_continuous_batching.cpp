@@ -17,12 +17,7 @@ int main() {
   for (int cyc = 0; cyc < 100; ++cyc) {
     std::vector<Dispatch> ds = fab.schedule(TimePoint(static_cast<Nanoseconds>(cyc * 1000)));
     for (Dispatch& d : ds) {
-      DecodeExecutionRequest q;
-      q.dispatch_id = d.id; q.epoch = d.epoch; q.worker = d.worker; q.worker_boot = d.worker_boot;
-      q.key = d.key; q.device = d.device; q.reservation_id = d.reservation.value(); q.members = d.members;
-      { std::string k = d.key.to_string(); q.group_payload.assign(k.begin(), k.end()); }
-      auto r = ex.execute(q);
-      if (r.ok()) (void)fab.apply_completion(r.value());
+      ex::drive(fab, ex, d);
       sizes.push_back(d.members.size());
     }
     if (fab.active_sequences() == 0) break;

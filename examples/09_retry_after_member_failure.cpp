@@ -3,6 +3,11 @@
 using namespace decodefabric;
 
 // A deterministic executor that fails one specific sequence once, then succeeds.
+// It delegates to a real CPU executor but, on the target sequence's first
+// prepare, reports a RetryableFailure (a non-commit outcome). The fabric then
+// applies retry semantics (a new AttemptId, no rollback of committed tokens) and
+// aborts the prepared transition; the executor's committed pre-state is
+// unchanged, so the retry re-prepares from the same pre-state.
 class FailOnceExecutor final : public DecodeExecutor {
  public:
   explicit FailOnceExecutor(std::uint64_t target) : target_(target), inner_(DeviceId::from(1)) {}
@@ -10,20 +15,23 @@ class FailOnceExecutor final : public DecodeExecutor {
   BackendKind backend() const override { return inner_.backend(); }
   DeviceDescriptor device() const override { return inner_.device(); }
   bool supports(const CompatibilityKey& key) const override { return inner_.supports(key); }
-  Result<DecodeExecutionResult> execute(const DecodeExecutionRequest& req) override {
-    auto r = inner_.execute(req);
-    if (r.ok()) {
-      for (auto& mo : r.value().outcomes) {
-        if (!failed_ && mo.sequence.value() == target_) {
-          mo.kind = MemberOutcomeKind::RetryableFailure;
-          mo.error_code = ErrorCode::RetryableFailure;
-          mo.retryable = true;
+  Result<PreparedDecode> prepare(const DecodeExecutionRequest& req) override {
+    auto r = inner_.prepare(req);
+    if (r.ok() && !failed_) {
+      for (auto& pm : r.value().members) {
+        if (pm.sequence.value() == target_) {
+          pm.outcome.kind = MemberOutcomeKind::RetryableFailure;
+          pm.outcome.error_code = ErrorCode::RetryableFailure;
+          pm.outcome.retryable = true;
+          pm.outcome.terminal = false;
           failed_ = true;
         }
       }
     }
     return r;
   }
+  Result<MemberReceipt> commit(const CommitGrant& g) override { return inner_.commit(g); }
+  Result<void> abort(const AbortPrepared& a) override { return inner_.abort(a); }
  private:
   std::uint64_t target_;
   bool failed_ = false;

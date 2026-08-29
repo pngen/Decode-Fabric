@@ -26,6 +26,7 @@ const char* to_string(ErrorCode code) noexcept {
     case ErrorCode::DuplicateId: return "duplicate_id";
     case ErrorCode::DuplicateRequest: return "duplicate_request";
     case ErrorCode::UnknownSequence: return "unknown_sequence";
+    case ErrorCode::UnknownState: return "unknown_state";
     case ErrorCode::IncompatibleGroupMembers: return "incompatible_group_members";
     case ErrorCode::NoCompatibleWorker: return "no_compatible_worker";
     case ErrorCode::GroupFull: return "group_full";
@@ -52,6 +53,9 @@ const char* to_string(ErrorCode code) noexcept {
     case ErrorCode::CompletionForExpired: return "completion_for_expired";
     case ErrorCode::CompletionForTerminal: return "completion_for_terminal";
     case ErrorCode::SupersededByRetry: return "superseded_by_retry";
+    case ErrorCode::StateDigestMismatch: return "state_digest_mismatch";
+    case ErrorCode::TransactionConflict: return "transaction_conflict";
+    case ErrorCode::GrantConsumed: return "grant_consumed";
     case ErrorCode::RetryBudgetExhausted: return "retry_budget_exhausted";
     case ErrorCode::NonRetryableFailure: return "non_retryable_failure";
     case ErrorCode::RetryableFailure: return "retryable_failure";

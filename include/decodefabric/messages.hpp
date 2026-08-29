@@ -20,6 +20,23 @@ Result<DecodeExecutionRequest> decode_execute_request(const std::vector<std::uin
 std::vector<std::uint8_t> encode_execute_result(const DecodeExecutionResult& res);
 Result<DecodeExecutionResult> decode_execute_result(const std::vector<std::uint8_t>& bytes);
 
+// --- Transactional executor-state protocol ----------------------------------
+// PreparedResult (worker -> coordinator after a prepare).
+std::vector<std::uint8_t> encode_prepared_result(const PreparedDecode& res);
+Result<PreparedDecode> decode_prepared_result(const std::vector<std::uint8_t>& bytes);
+
+// CommitGrant (coordinator -> worker): a one-use authorization for one member.
+std::vector<std::uint8_t> encode_commit_grant(const CommitGrant& g);
+Result<CommitGrant> decode_commit_grant(const std::vector<std::uint8_t>& bytes);
+
+// CommitReceipt (worker -> coordinator): binding receipts for committed members.
+std::vector<std::uint8_t> encode_commit_receipts(const ReceiptDecode& r);
+Result<ReceiptDecode> decode_commit_receipts(const std::vector<std::uint8_t>& bytes);
+
+// AbortPrepared (coordinator -> worker, or a stale/prepare driver): discard a transition.
+std::vector<std::uint8_t> encode_abort_prepared(const AbortPrepared& a);
+Result<AbortPrepared> decode_abort_prepared(const std::vector<std::uint8_t>& bytes);
+
 // --- SubmitRequest (client -> coordinator) ----------------------------------
 std::vector<std::uint8_t> encode_submit_request(const DecodeRequest& req);
 Result<DecodeRequest> decode_submit_request(const std::vector<std::uint8_t>& bytes);
