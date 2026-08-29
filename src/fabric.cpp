@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <shared_mutex>
@@ -187,8 +188,10 @@ struct DecodeFabric::Impl {
   // executor-resident state; only fabric canonical state may transition.
   // On a stale/authority rejection, the in-flight dispatch is no longer
   // valid. Clear it, release the reservation, and place the sequence back into
-  // a candidate state so a later re-dispatch begins from a fresh dispatch and
-  // the unchanged committed pre-state.
+  // a *dispatchable* candidate state so a later re-dispatch begins from a fresh
+  // dispatch and the unchanged committed pre-state. ReadyForNextToken is used
+  // because it (unlike Waiting) can transition directly to Grouped; a sequence
+  // left in Waiting is a candidate that can never be dispatched.
   void stale_reconcile(Seq& s, SequenceId seq) {
     s.has_inflight = false;
     s.in_flight_dispatch = DispatchId::null();
@@ -199,7 +202,7 @@ struct DecodeFabric::Impl {
     if (!is_terminal(s.machine.state()) &&
         (s.machine.state() == SequenceState::Dispatched || s.machine.state() == SequenceState::Running)) {
       s.machine.transition_to(SequenceState::StepCompleted);
-      s.machine.transition_to(SequenceState::Waiting);
+      s.machine.transition_to(SequenceState::ReadyForNextToken);
       s.ready_at = now();
     }
   }
@@ -965,6 +968,7 @@ Result<DecodeFabric::AuthorizeResult> DecodeFabric::authorize_prepared(const Pre
     if (s.has_inflight_grant) {
       impl_->stale_reconcile(s, pm.sequence);
       impl_->stats.stale_rejections++;
+
       ga.rejected = true; ga.aborted = true; ga.error_code = ErrorCode::TransactionConflict;
       ga.reason = "conflicting pending grant for sequence+generation";
       ar.members.push_back(std::move(ga));
@@ -973,6 +977,7 @@ Result<DecodeFabric::AuthorizeResult> DecodeFabric::authorize_prepared(const Pre
     if (pm.committed_position_before != s.generated) {
       impl_->stale_reconcile(s, pm.sequence);
       impl_->stats.stale_rejections++;
+
       ga.rejected = true; ga.aborted = true; ga.error_code = ErrorCode::InvalidArgument;
       ga.reason = "committed-position mismatch";
       ar.members.push_back(std::move(ga));
@@ -981,6 +986,7 @@ Result<DecodeFabric::AuthorizeResult> DecodeFabric::authorize_prepared(const Pre
     if (s.state_digest_established && pm.pre_state_digest != s.committed_state_digest) {
       impl_->stale_reconcile(s, pm.sequence);
       impl_->stats.stale_rejections++;
+
       ga.rejected = true; ga.aborted = true; ga.error_code = ErrorCode::StateDigestMismatch;
       ga.reason = "pre-state digest does not match committed executor state";
       ar.members.push_back(std::move(ga));
@@ -1020,6 +1026,7 @@ Result<DecodeFabric::AuthorizeResult> DecodeFabric::authorize_prepared(const Pre
     ga.has_abort = false;  // this member commits, not aborts
     ar.members.push_back(std::move(ga));
     impl_->record_event(EventKind::ReservationGranted, s.req.id, pm.sequence, "commit_grant_issued");
+
   }
   return Result<AuthorizeResult>::ok(std::move(ar));
 }

@@ -18,6 +18,24 @@ inline std::uint64_t digest_state(const std::vector<double>& s,
   h = fnv_mix(h, kv_bytes);
   return h;
 }
+
+// Deterministic single decode step: the tanh recurrence then bounded
+// renormalization. Used both by prepare() and by the deterministic state
+// reconstruction contract (a fresh worker rebuilds the committed state by
+// applying exactly the authoritative committed-token count of these steps).
+inline std::vector<double> step_state(const std::vector<double>& state) {
+  const std::size_t N = state.size();
+  std::vector<double> next(N);
+  for (std::size_t i = 0; i < N; ++i) {
+    double prev = state[(i + 1) % N];
+    double acc = 0.5 * state[i] + 0.25 * prev;
+    next[i] = std::tanh(acc + 0.1 * std::sin(static_cast<double>(i)));
+  }
+  double norm = 0.0;
+  for (double v : next) norm += v * v;
+  if (norm > 0.0) { double inv = 1.0 / std::sqrt(norm); for (double& v : next) v *= inv; }
+  return next;
+}
 }  // namespace
 
 std::uint64_t CpuDecodeExecutor::kStateSize = 8;
@@ -79,15 +97,30 @@ std::uint32_t CpuDecodeExecutor::step_token(const std::vector<double>& s) {
 }
 
 Result<void> CpuDecodeExecutor::ensure_initialized(SeqState& st, const DecodeMemberSpec& m) {
-  if (!st.state.empty()) return Result<void>::success();
-  std::uint64_t seed = m.generated_tokens ? 1 : 0;
-  st.state = initial_state(m.state.id, seed + m.attempt.value());
-  st.tokens = 0;
-  st.kv_bytes = m.state.bytes_held ? m.state.bytes_held : 0;
-  st.eos_enabled = false;
-  st.eos_target = 0;
-  if (m.payload.size() >= 1) { st.eos_enabled = (m.payload[0] & 0x01) != 0; }
-  if (m.payload.size() >= 2) { st.eos_target = m.payload[1]; }
+  // Deterministic S0 from (state.id, attempt); the seed never depends on the
+  // generated-token count so that a fresh worker reproduces the same S0.
+  if (st.state.empty()) {
+    st.state = initial_state(m.state.id, m.attempt.value());
+    st.tokens = 0;
+    st.kv_bytes = m.state.bytes_held ? m.state.bytes_held : 0;
+    st.eos_enabled = false;
+    st.eos_target = 0;
+    if (m.payload.size() >= 1) { st.eos_enabled = (m.payload[0] & 0x01) != 0; }
+    if (m.payload.size() >= 2) { st.eos_target = m.payload[1]; }
+  }
+  // Deterministic reconstruction/catch-up: if this worker's local committed
+  // state is behind the authoritative committed-token count (either it is
+  // adopting a sequence whose committed state lives on another worker, or a
+  // restarted worker), advance it forward to match. This makes the
+  // committed-state digest and committed-token position consistent with the
+  // coordinator, so any worker can serve any sequence and a restarted worker
+  // re-derives the exact same state.
+  const std::uint64_t delta = 64;
+  while (st.tokens < m.generated_tokens) {
+    st.state = step_state(st.state);
+    st.tokens += 1;
+    st.kv_bytes += delta;
+  }
   return Result<void>::success();
 }
 
@@ -112,7 +145,7 @@ Result<PreparedMember> CpuDecodeExecutor::prepare_member(
   auto t0 = std::chrono::steady_clock::now();
   // mu_ is held by the caller.
   SeqState& st = states_[m.state.id];
-  if (st.state.empty()) {
+  {
     auto r = ensure_initialized(st, m);
     if (!r.ok()) return failed<PreparedMember>(r.error().code, r.error().message);
   }
@@ -138,17 +171,8 @@ Result<PreparedMember> CpuDecodeExecutor::prepare_member(
   }
 
   // --- Prepare from the committed pre-state only. ---
-  const std::size_t N = st.state.size();
-  std::vector<double> next(N);
-  for (std::size_t i = 0; i < N; ++i) {
-    double prev = st.state[(i + 1) % N];
-    double acc = 0.5 * st.state[i] + 0.25 * prev;
-    next[i] = std::tanh(acc + 0.1 * std::sin(static_cast<double>(i)));
-  }
+  std::vector<double> next = step_state(st.state);
   std::uint32_t token = step_token(next);
-  double norm = 0.0;
-  for (double v : next) norm += v * v;
-  if (norm > 0.0) { double inv = 1.0 / std::sqrt(norm); for (double& v : next) v *= inv; }
 
   std::uint64_t delta = 64;  // per-token KV growth (bytes)
   std::uint64_t before_tokens = st.tokens;
