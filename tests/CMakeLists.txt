@@ -34,6 +34,11 @@ target_link_libraries(transactional_test PRIVATE decodefabric)
 target_include_directories(transactional_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 add_test(NAME unit_transactional COMMAND transactional_test)
 
+add_executable(invariants_test test_main.cpp invariants_test.cpp)
+target_link_libraries(invariants_test PRIVATE decodefabric)
+target_include_directories(invariants_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME unit_invariants COMMAND invariants_test)
+
 add_executable(distributed_smoke test_main.cpp distributed_smoke.cpp)
 target_link_libraries(distributed_smoke PRIVATE decodefabric)
 target_include_directories(distributed_smoke PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
