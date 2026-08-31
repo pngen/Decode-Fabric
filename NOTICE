@@ -1,10 +1,8 @@
 Decode Fabric
 
-Copyright (c) Summon Software Labs
+Copyright © Summon Software Labs
 
-Decode Fabric is an open-source, vendor-neutral runtime for scheduling,
-batching, executing, measuring, and governing iterative token-decoding work
-across heterogeneous AI inference infrastructure.
+Decode Fabric is an open-source, vendor-neutral runtime for scheduling, batching, executing, measuring, and governing iterative token-decoding work across heterogeneous AI inference infrastructure.
 
 This product is licensed under the Apache License, Version 2.0. See the
 LICENSE file in this distribution for the full license text.
@@ -13,8 +11,6 @@ Decode Fabric does not collect or transmit any telemetry. All telemetry is
 written to local files chosen by the operator and never leaves the machine
 running the software.
 
-Decode Fabric accepts contributions from individuals and organizations on
-the terms of the Apache License 2.0 without requiring a Contributor License
+Decode Fabric accepts contributions from individuals and organizations on the
+terms of the Apache License 2.0 without requiring a Contributor License
 Agreement (CLA). See CONTRIBUTING.md for contribution guidance.
-
-No telemetry transmission.
