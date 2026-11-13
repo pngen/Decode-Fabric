@@ -14,7 +14,11 @@ Layout (little-endian, all integers raw):
   prompt length, max generation length, generated count, generation, generated,
   committed, current length, deadline (ns), priority, latency class, state,
   KV StateDescriptor (id, generation, bytes held, estimated growth, owner tag),
-  attempt count.
+  attempt count, then the committed-state digest and accepted-generation record.
+  Version 4 adds, per sequence: adapter id, device constraint, sampling metadata,
+  the state's device and access version, tenant weight, per-token latency target
+  and arrival time. Version 3 snapshots are still read; those fields keep their
+  defaults.
 - uint64 terminal-idempotency record count, then (sequence id, terminal state).
 - uint32 CRC-32 of all preceding bytes.
 

@@ -44,6 +44,11 @@ target_link_libraries(recovery_idempotency_test PRIVATE decodefabric)
 target_include_directories(recovery_idempotency_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 add_test(NAME unit_recovery_idempotency COMMAND recovery_idempotency_test)
 
+add_executable(regression_test test_main.cpp regression_test.cpp)
+target_link_libraries(regression_test PRIVATE decodefabric)
+target_include_directories(regression_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME unit_regression COMMAND regression_test)
+
 add_executable(distributed_smoke test_main.cpp distributed_smoke.cpp)
 target_link_libraries(distributed_smoke PRIVATE decodefabric)
 target_include_directories(distributed_smoke PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

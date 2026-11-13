@@ -19,18 +19,6 @@ inline std::uint64_t digest_dev(const std::vector<float>& s,
   h = fnv_mix(h, kv_bytes);
   return h;
 }
-
-// Host mirror of the device decode step (no renormalization, matching the
-// kernel exactly). Used by the deterministic reconstruction contract.
-inline std::vector<float> step_state_float(std::vector<float> in) {
-  const std::size_t N = in.size();
-  std::vector<float> out(N);
-  for (std::size_t i = 0; i < N; ++i) {
-    float prev = in[(i + 1) % N];
-    out[i] = tanhf(0.5f * in[i] + 0.25f * prev + 0.1f * sinf(static_cast<float>(i)));
-  }
-  return out;
-}
 }  // namespace
 
 __global__ void df_decode_step_kernel(const float* __restrict__ in, float* __restrict__ out,
@@ -152,17 +140,36 @@ Result<void> CudaDecodeExecutor::ensure_initialized(DevState& st, const DecodeMe
   // the committed-state digest and committed-token position match the
   // coordinator. Bounded host copyback for the reconstruction steps.
   if (st.tokens < m.generated_tokens) {
-    std::vector<float> host(kStateSize);
-    if (cudaMemcpy(host.data(), st.device, kStateSize * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess)
-      return failed<void>(ErrorCode::BackendError, "cudaMemcpy reconstruction read failed");
+    // The catch-up steps run on the device with the same kernel the decode
+    // steps use. A host re-implementation does not reproduce the device's
+    // floating-point results, so the rebuilt state would never match the
+    // committed state digest and the sequence could not advance here.
+    float* next = nullptr;
+    std::uint32_t* d_token = nullptr;
+    std::uint64_t* d_cksum = nullptr;
+    auto release = [&]() {
+      if (next) cudaFree(next);
+      if (d_token) cudaFree(d_token);
+      if (d_cksum) cudaFree(d_cksum);
+    };
+    if (cudaMalloc(reinterpret_cast<void**>(&next), kStateSize * sizeof(float)) != cudaSuccess ||
+        cudaMalloc(reinterpret_cast<void**>(&d_token), sizeof(std::uint32_t)) != cudaSuccess ||
+        cudaMalloc(reinterpret_cast<void**>(&d_cksum), sizeof(std::uint64_t)) != cudaSuccess) {
+      release();
+      return failed<void>(ErrorCode::BackendError, "cudaMalloc reconstruction failed");
+    }
     const std::uint64_t delta = 64;
     while (st.tokens < m.generated_tokens) {
-      host = step_state_float(std::move(host));
+      df_decode_step_kernel<<<1, kStateSize>>>(st.device, next, d_token, d_cksum, static_cast<int>(kStateSize));
+      if (cudaGetLastError() != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess) {
+        release();
+        return failed<void>(ErrorCode::BackendError, "reconstruction step failed");
+      }
+      std::swap(st.device, next);  // the stepped state becomes the committed one
       st.tokens += 1;
       st.kv_bytes += delta;
     }
-    if (cudaMemcpy(st.device, host.data(), kStateSize * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess)
-      return failed<void>(ErrorCode::BackendError, "cudaMemcpy reconstruction write failed");
+    release();
   }
   return Result<void>::success();
 }

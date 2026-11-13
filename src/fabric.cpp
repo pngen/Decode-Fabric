@@ -159,6 +159,11 @@ struct DecodeFabric::Impl {
   std::unordered_map<TenantId, std::uint32_t> tenant_active;
   std::unordered_map<SequenceId, SequenceState> terminal_records;
   std::unordered_map<ReservationId, Reservation> reservations;
+  // A group reservation is shared by every member of its dispatch and holds one
+  // capacity unit of the worker the dispatch went to. Both are given back when
+  // the last member leaves the dispatch, not when the first one does.
+  struct Holders { WorkerId worker; std::uint32_t members = 0; };
+  std::unordered_map<ReservationId, Holders> reservation_holders;
   std::vector<Event> events;
   std::size_t event_head = 0;
   Stats stats;
@@ -172,6 +177,7 @@ struct DecodeFabric::Impl {
   void ensure_clock() { if (!clock) { own_clock = std::make_unique<MonotonicClock>(); clock = own_clock.get(); } }
   TimePoint now() const { return clock->now(); }
   void record_event(EventKind k, RequestId r = {}, SequenceId s = {}, std::string detail = {}) {
+    if (cfg.event_capacity == 0) return;  // no retention configured
     Event e;
     e.id = EventId::from(events.size() + 1);
     e.time = now();
@@ -188,19 +194,47 @@ struct DecodeFabric::Impl {
     if (it == seqs.end()) return false;
     Seq& s = it->second;
     if (s.reservation.is_null()) return false;
-    auto rit = reservations.find(s.reservation);
-    if (rit != reservations.end()) {
-      if (!rit->second.released) {
-        rit->second.released = true;
-        auto dm = dev_mem.find(rit->second.device);
-        if (dm != dev_mem.end() && dm->second.reserved >= rit->second.bytes) dm->second.reserved -= rit->second.bytes;
-        else if (dm != dev_mem.end()) dm->second.reserved = 0;
-        reservations.erase(rit);
-        record_event(EventKind::ReservationReleased, s.req.id, seq, "released");
+    auto hit = reservation_holders.find(s.reservation);
+    const bool last = hit == reservation_holders.end() || hit->second.members <= 1;
+    if (!last) {
+      --hit->second.members;
+    } else {
+      auto rit = reservations.find(s.reservation);
+      if (rit != reservations.end()) {
+        if (!rit->second.released) {
+          rit->second.released = true;
+          auto dm = dev_mem.find(rit->second.device);
+          if (dm != dev_mem.end() && dm->second.reserved >= rit->second.bytes) dm->second.reserved -= rit->second.bytes;
+          else if (dm != dev_mem.end()) dm->second.reserved = 0;
+          reservations.erase(rit);
+          record_event(EventKind::ReservationReleased, s.req.id, seq, "released");
+        }
+      }
+      if (hit != reservation_holders.end()) {
+        auto wit = workers.find(hit->second.worker);
+        if (wit != workers.end() && wit->second.active_reservations > 0) wit->second.active_reservations--;
+        reservation_holders.erase(hit);
       }
     }
     s.reservation = ReservationId::null();
     return true;
+  }
+
+  // Saturating decrement of a tenant's active-sequence count.
+  void dec_tenant(TenantId t) {
+    auto it = tenant_active.find(t);
+    if (it != tenant_active.end() && it->second > 0) it->second--;
+  }
+
+  // Mark the sequence's pending commit grant aborted and forget it.
+  void abort_pending_grant(Seq& s) {
+    if (s.has_inflight_grant) {
+      auto git = grant_ledger.find(s.in_flight_grant);
+      if (git != grant_ledger.end() && git->second.status == 0) git->second.status = 2;
+    }
+    s.has_inflight_grant = false;
+    s.in_flight_grant = GrantId::null();
+    s.in_flight_proposal = ProposalId::null();
   }
 
   bool is_candidate_state(SequenceState st) const {
@@ -241,9 +275,7 @@ struct DecodeFabric::Impl {
   void stale_reconcile(Seq& s, SequenceId seq) {
     s.has_inflight = false;
     s.in_flight_dispatch = DispatchId::null();
-    s.has_inflight_grant = false;
-    s.in_flight_grant = GrantId::null();
-    s.in_flight_proposal = ProposalId::null();
+    abort_pending_grant(s);
     release_reservation(seq);
     if (!is_terminal(s.machine.state()) &&
         (s.machine.state() == SequenceState::Dispatched || s.machine.state() == SequenceState::Running)) {
@@ -253,10 +285,20 @@ struct DecodeFabric::Impl {
     }
   }
 
+  // A retry mints an attempt id the sequence has never used: attempts only grow.
+  AttemptId mint_attempt(const Seq& s) const {
+    std::uint64_t a = next_dispatch + 1000000;
+    if (a <= s.current_attempt.value()) a = s.current_attempt.value() + 1;
+    return AttemptId::from(a);
+  }
+
   void apply_noncommit_outcome(Seq& s, const MemberOutcome& mo) {
     switch (mo.kind) {
       case MemberOutcomeKind::Yielded: {
+        // Yielded is reached from the step boundary (a StepCompleted sequence
+        // cannot yield directly); the scheduler makes it Ready again.
         s.machine.transition_to(SequenceState::StepCompleted);
+        s.machine.transition_to(SequenceState::ReadyForNextToken);
         s.machine.transition_to(SequenceState::Yielded);
         s.ready_at = mo.finished_at;
         record_event(EventKind::Yielding, s.req.id, mo.sequence, "yielded");
@@ -264,19 +306,23 @@ struct DecodeFabric::Impl {
       }
       case MemberOutcomeKind::RetryableFailure: {
         release_reservation(mo.sequence);
-        if (s.machine.state() == SequenceState::Dispatched) s.machine.transition_to(SequenceState::RetryableFailure);
         if (s.attempt_count >= cfg.retry_policy.max_attempts) {
-          s.machine.transition_to(SequenceState::NonRetryableFailure);
-          terminal_records[mo.sequence] = SequenceState::NonRetryableFailure;
-          stats.sequences_failed++;
-          record_event(EventKind::RetryFailed, s.req.id, mo.sequence, "retry_budget_exhausted");
+          // Out of attempts: the failure is final. (RetryableFailure can only
+          // lead to Retrying, so the terminal state is entered directly.)
+          if (s.machine.transition_to(SequenceState::NonRetryableFailure).ok()) {
+            dec_tenant(s.req.tenant);
+            terminal_records[mo.sequence] = SequenceState::NonRetryableFailure;
+            stats.sequences_failed++;
+            record_event(EventKind::RetryFailed, s.req.id, mo.sequence, "retry_budget_exhausted");
+          }
         } else {
+          if (s.machine.state() == SequenceState::Dispatched) s.machine.transition_to(SequenceState::RetryableFailure);
           if (!cfg.retry_policy.preserve_committed_tokens) {
             s.generated = s.committed;
             s.budget = TokenBudget(s.req.max_generation_length);
             for (std::uint64_t kk = 0; kk < s.committed; ++kk) s.budget.advance(1);
           }
-          s.current_attempt = AttemptId::from(next_dispatch + 1000000);
+          s.current_attempt = mint_attempt(s);
           ++s.attempt_count;
           s.machine.transition_to(SequenceState::Retrying);
           s.machine.transition_to(SequenceState::Ready);
@@ -288,7 +334,7 @@ struct DecodeFabric::Impl {
       }
       case MemberOutcomeKind::NonRetryableFailure: {
         if (s.machine.state() == SequenceState::Dispatched) s.machine.transition_to(SequenceState::NonRetryableFailure);
-        tenant_active[s.req.tenant] = std::max(0u, tenant_active[s.req.tenant] - 1u);
+        dec_tenant(s.req.tenant);
         stats.sequences_failed++;
         terminal_records[mo.sequence] = SequenceState::NonRetryableFailure;
         record_event(EventKind::RequestRejected, s.req.id, mo.sequence, mo.error_message);
@@ -297,7 +343,7 @@ struct DecodeFabric::Impl {
       case MemberOutcomeKind::Cancelled: {
         if (!is_terminal(s.machine.state())) {
           s.machine.transition_to(SequenceState::Cancelled);
-          tenant_active[s.req.tenant] = std::max(0u, tenant_active[s.req.tenant] - 1u);
+          dec_tenant(s.req.tenant);
           stats.cancellations++; stats.sequences_cancelled++;
           terminal_records[mo.sequence] = SequenceState::Cancelled;
           record_event(EventKind::SequenceCancelled, s.req.id, mo.sequence, "backend_cancel");
@@ -307,7 +353,7 @@ struct DecodeFabric::Impl {
       case MemberOutcomeKind::Expired: {
         if (!is_terminal(s.machine.state())) {
           s.machine.transition_to(SequenceState::DeadlineExpired);
-          tenant_active[s.req.tenant] = std::max(0u, tenant_active[s.req.tenant] - 1u);
+          dec_tenant(s.req.tenant);
           stats.deadline_misses++; stats.sequences_expired++;
           terminal_records[mo.sequence] = SequenceState::DeadlineExpired;
           record_event(EventKind::SequenceExpired, s.req.id, mo.sequence, "backend_expired");
@@ -316,6 +362,15 @@ struct DecodeFabric::Impl {
       }
       default: break;
     }
+  }
+
+  // A stale message about the dispatch the sequence is waiting on ends that
+  // dispatch, and the sequence is re-queued under fresh authority. A stale
+  // message about any other dispatch says nothing about the live one, and a
+  // dispatch with an outstanding commit grant is settled by that grant's
+  // receipt; neither is touched.
+  void reconcile_if_current(Seq& s, SequenceId seq, DispatchId dispatch) {
+    if (s.has_inflight && dispatch == s.in_flight_dispatch && !s.has_inflight_grant) stale_reconcile(s, seq);
   }
 
   void refresh_derived_stats() {
@@ -464,7 +519,7 @@ CancelResult DecodeFabric::cancel(SequenceId seq) {
     // Between steps: cancel immediately at the boundary.
     impl_->release_reservation(seq);
     s.machine.transition_to(SequenceState::Cancelled);
-    impl_->tenant_active[s.req.tenant] = std::max(0u, impl_->tenant_active[s.req.tenant] - 1u);
+    impl_->dec_tenant(s.req.tenant);
     impl_->stats.cancellations++;
     impl_->stats.sequences_cancelled++;
     impl_->terminal_records[seq] = SequenceState::Cancelled;
@@ -477,11 +532,16 @@ CancelResult DecodeFabric::cancel(SequenceId seq) {
 }
 
 CancelResult DecodeFabric::cancel_request(RequestId req) {
-  std::unique_lock lk(impl_->mtx);
-  auto it = impl_->req_to_seq.find(req);
-  lk.unlock();
-  if (it == impl_->req_to_seq.end()) { CancelResult c; c.reason = "unknown_request"; return c; }
-  return cancel(it->second);
+  SequenceId seq;
+  {
+    // The map may be rehashed by another thread once the lock is released, so
+    // the id is copied out while it is held.
+    std::unique_lock lk(impl_->mtx);
+    auto it = impl_->req_to_seq.find(req);
+    if (it == impl_->req_to_seq.end()) { CancelResult c; c.reason = "unknown_request"; return c; }
+    seq = it->second;
+  }
+  return cancel(seq);
 }
 
 // ===========================================================================
@@ -495,21 +555,31 @@ RetryResult DecodeFabric::retry(SequenceId seq) {
   Impl::Seq& s = it->second;
   if (s.machine.state() == SequenceState::RetryableFailure || s.machine.state() == SequenceState::Running ||
       s.machine.state() == SequenceState::Dispatched) {
+    // The dispatch the retry supersedes can no longer complete: its
+    // reservation, worker capacity unit and pending grant are given back.
+    if (s.has_inflight) {
+      s.has_inflight = false;
+      s.in_flight_dispatch = DispatchId::null();
+      impl_->abort_pending_grant(s);
+    }
+    impl_->release_reservation(seq);
     // Bound attempt count.
     if (!impl_->cfg.retry_policy.preserve_committed_tokens) {
       // Explicit recovery point semantics: roll back to last committed point.
       s.generated = s.committed;
     }
     if (s.attempt_count >= impl_->cfg.retry_policy.max_attempts) {
-      s.machine.transition_to(SequenceState::NonRetryableFailure);
-      impl_->terminal_records[seq] = SequenceState::NonRetryableFailure;
-      impl_->stats.sequences_failed++;
-      impl_->record_event(EventKind::RetryFailed, s.req.id, seq, "retry_budget_exhausted");
+      if (s.machine.transition_to(SequenceState::NonRetryableFailure).ok()) {
+        impl_->dec_tenant(s.req.tenant);
+        impl_->terminal_records[seq] = SequenceState::NonRetryableFailure;
+        impl_->stats.sequences_failed++;
+        impl_->record_event(EventKind::RetryFailed, s.req.id, seq, "retry_budget_exhausted");
+      }
       r.reason = "retry_budget_exhausted";
       return r;
     }
     // Mint a NEW AttemptId.
-    s.current_attempt = AttemptId::from(impl_->next_dispatch + 1000000);
+    s.current_attempt = impl_->mint_attempt(s);
     ++s.attempt_count;
     s.generation = s.generation;  // committed generation preserved
     s.machine.transition_to(SequenceState::Retrying);
@@ -533,7 +603,22 @@ RetryResult DecodeFabric::retry(SequenceId seq) {
 Result<void> DecodeFabric::register_worker(const WorkerDescriptor& wd) {
   std::unique_lock lk(impl_->mtx);
   if (!wd.valid()) return failed<void>(ErrorCode::UnknownWorker, "invalid worker descriptor");
+  auto existing = impl_->workers.find(wd.id);
+  const bool known = existing != impl_->workers.end();
+  const bool restarted = known && existing->second.boot_id != wd.boot_id;
+  if (restarted) {
+    // A new boot id is a new process: the previous one can no longer prepare
+    // or commit what it was given, so that work is re-queued now instead of
+    // waiting for results that will never come.
+    for (auto& kv : impl_->seqs) {
+      Impl::Seq& s = kv.second;
+      if (s.has_inflight && s.in_flight_worker == wd.id) impl_->stale_reconcile(s, kv.first);
+    }
+  }
+  // The same process registering again keeps the capacity its dispatches use.
+  const std::uint64_t in_use = (known && !restarted) ? existing->second.active_reservations : 0;
   impl_->workers[wd.id] = wd;
+  impl_->workers[wd.id].active_reservations = in_use;
   impl_->worker_current_boot[wd.id] = wd.boot_id;
   auto& dm = impl_->dev_mem[wd.device.id];
   dm.capacity = std::max(dm.capacity, wd.device.memory_bytes);
@@ -547,20 +632,12 @@ Result<void> DecodeFabric::mark_worker_dead(WorkerId id) {
   auto wit = impl_->workers.find(id);
   if (wit != impl_->workers.end()) { wit->second.health = WorkerHealth::Failed; wit->second.active_reservations = 0; }
   impl_->record_event(EventKind::WorkerDown, {}, {}, "worker " + std::to_string(id.value()));
-  // Reconcile formerly-running work on this worker: re-queue, release reservations.
+  // Reconcile formerly-running work on this worker: re-queue, release
+  // reservations and pending grants. The sequences go to ReadyForNextToken: a
+  // Waiting sequence cannot be grouped, so it would never run again.
   for (auto& kv : impl_->seqs) {
     Impl::Seq& s = kv.second;
-    if (s.has_inflight && s.in_flight_worker == id) {
-      impl_->release_reservation(kv.first);
-      s.has_inflight = false;
-      if (!is_terminal(s.machine.state())) {
-        if (s.machine.state() == SequenceState::Dispatched || s.machine.state() == SequenceState::Running) {
-          s.machine.transition_to(SequenceState::StepCompleted);
-          s.machine.transition_to(SequenceState::Waiting);
-        }
-        s.ready_at = impl_->now();
-      }
-    }
+    if (s.has_inflight && s.in_flight_worker == id) impl_->stale_reconcile(s, kv.first);
   }
   return Result<void>::success();
 }
@@ -585,7 +662,7 @@ Result<void> DecodeFabric::advance(TimePoint tn) {
       impl_->release_reservation(kv.first);
       if (!is_terminal(s.machine.state())) {
         s.machine.transition_to(SequenceState::DeadlineExpired);
-        impl_->tenant_active[s.req.tenant] = std::max(0u, impl_->tenant_active[s.req.tenant] - 1u);
+        impl_->dec_tenant(s.req.tenant);
         impl_->stats.deadline_misses++;
         impl_->stats.sequences_expired++;
         impl_->terminal_records[kv.first] = SequenceState::DeadlineExpired;
@@ -597,7 +674,7 @@ Result<void> DecodeFabric::advance(TimePoint tn) {
     if (s.machine.state() == SequenceState::CancelRequested) {
       impl_->release_reservation(kv.first);
       s.machine.transition_to(SequenceState::Cancelled);
-      impl_->tenant_active[s.req.tenant] = std::max(0u, impl_->tenant_active[s.req.tenant] - 1u);
+      impl_->dec_tenant(s.req.tenant);
       impl_->stats.cancellations++;
       impl_->stats.sequences_cancelled++;
       impl_->terminal_records[kv.first] = SequenceState::Cancelled;
@@ -629,14 +706,14 @@ std::vector<Dispatch> DecodeFabric::schedule(TimePoint tn) {
     if (s.req.deadline.ns != 0 && tn.ns >= s.req.deadline.ns) {
       impl_->release_reservation(kv.first);
       s.machine.transition_to(SequenceState::DeadlineExpired);
-      impl_->tenant_active[s.req.tenant] = std::max(0u, impl_->tenant_active[s.req.tenant] - 1u);
+      impl_->dec_tenant(s.req.tenant);
       impl_->stats.deadline_misses++; impl_->stats.sequences_expired++;
       impl_->terminal_records[kv.first] = SequenceState::DeadlineExpired;
     }
     if (s.machine.state() == SequenceState::CancelRequested) {
       impl_->release_reservation(kv.first);
       s.machine.transition_to(SequenceState::Cancelled);
-      impl_->tenant_active[s.req.tenant] = std::max(0u, impl_->tenant_active[s.req.tenant] - 1u);
+      impl_->dec_tenant(s.req.tenant);
       impl_->stats.cancellations++; impl_->stats.sequences_cancelled++;
       impl_->terminal_records[kv.first] = SequenceState::Cancelled;
     }
@@ -646,13 +723,20 @@ std::vector<Dispatch> DecodeFabric::schedule(TimePoint tn) {
   for (auto& kv : impl_->seqs) {
     Impl::Seq& s = kv.second;
     if (!impl_->is_candidate_state(s.machine.state())) continue;
+    // Only Ready and ReadyForNextToken sequences can be grouped; a Waiting or
+    // Yielded sequence becomes Ready first.
+    if (s.machine.state() == SequenceState::Waiting || s.machine.state() == SequenceState::Yielded)
+      (void)s.machine.transition_to(SequenceState::Ready);
     if (s.budget.exhausted()) {
-      // Budget exhausted but not terminal: make terminal now.
+      // Budget exhausted but not terminal: make terminal now. Counted only when
+      // the sequence really became terminal, so never once per cycle.
       impl_->release_reservation(kv.first);
-      s.machine.transition_to(SequenceState::Completed);
-      impl_->terminal_records[kv.first] = SequenceState::Completed;
-      impl_->stats.sequences_completed++;
-      impl_->record_event(EventKind::SequenceCompleted, s.req.id, kv.first, "budget_exhausted");
+      if (s.machine.transition_to(SequenceState::Completed).ok()) {
+        impl_->dec_tenant(s.req.tenant);
+        impl_->terminal_records[kv.first] = SequenceState::Completed;
+        impl_->stats.sequences_completed++;
+        impl_->record_event(EventKind::SequenceCompleted, s.req.id, kv.first, "budget_exhausted");
+      }
       continue;
     }
     CompatibilityKey k = impl_->key_for_model(s.req);
@@ -712,8 +796,11 @@ std::vector<Dispatch> DecodeFabric::schedule(TimePoint tn) {
     for (const SequenceId& m : g.members) if (impl_->seqs[m].req.tenant == s.req.tenant) ++tenant_share;
     if (lim.max_tenant_share > 0 && tenant_share >= lim.max_tenant_share) continue;
     if (lim.max_latency_class != LatencyClass::Bulk && s.req.latency_class > lim.max_latency_class) continue;
+    // A member is dispatched only if it really entered Grouped; otherwise every
+    // later transition of its step would fail and it would run with a state
+    // that can never complete.
+    if (!s.machine.transition_to(SequenceState::Grouped).ok()) continue;
     g.members.push_back(c.seq);
-    s.machine.transition_to(SequenceState::Grouped);
     s.last_grouped_at = tn;
     s.ready_at = tn;
   }
@@ -761,6 +848,7 @@ std::vector<Dispatch> DecodeFabric::schedule(TimePoint tn) {
     res.group = DecodeGroupId::from(impl_->next_group++);
     res.device = chosen->device.id; res.bytes = growth; res.made_at = tn;
     impl_->reservations.emplace(rid, res);
+    impl_->reservation_holders[rid] = Impl::Holders{chosen->id, static_cast<std::uint32_t>(g.members.size())};
     dm.reserved += growth;
     impl_->record_event(EventKind::ReservationGranted, {}, {}, "group_reservation");
 
@@ -825,8 +913,9 @@ Result<void> DecodeFabric::apply_completion(const DecodeExecutionResult& result)
 
     // --- Authority validation, most-stale first. ---
     if (result.epoch != impl_->epoch) {
-      s.has_inflight = false;
-      impl_->release_reservation(mo.sequence);
+      // Only a result for the live dispatch ends it; a replay of an older one
+      // must not take the live dispatch's reservation or authority away.
+      impl_->reconcile_if_current(s, mo.sequence, result.dispatch_id);
       impl_->stats.stale_rejections++;
       impl_->record_event(EventKind::StaleRejected, s.req.id, mo.sequence, "stale_epoch");
       continue;
@@ -835,6 +924,12 @@ Result<void> DecodeFabric::apply_completion(const DecodeExecutionResult& result)
     if (wit != impl_->worker_current_boot.end() && wit->second != result.worker_boot) {
       impl_->stats.stale_rejections++;
       impl_->record_event(EventKind::StaleRejected, s.req.id, mo.sequence, "stale_worker_boot");
+      continue;
+    }
+    if (s.has_inflight && result.worker != s.in_flight_worker) {
+      // Only the worker the step was dispatched to reports on it.
+      impl_->stats.stale_rejections++;
+      impl_->record_event(EventKind::StaleRejected, s.req.id, mo.sequence, "wrong_worker");
       continue;
     }
     if (mo.attempt != s.current_attempt) {
@@ -847,7 +942,7 @@ Result<void> DecodeFabric::apply_completion(const DecodeExecutionResult& result)
       impl_->record_event(EventKind::StaleRejected, s.req.id, mo.sequence, "stale_generation");
       continue;
     }
-    if (result.dispatch_id != s.in_flight_dispatch) {
+    if (!s.has_inflight || result.dispatch_id != s.in_flight_dispatch) {
       impl_->stats.stale_rejections++;
       impl_->record_event(EventKind::StaleRejected, s.req.id, mo.sequence, "stale_dispatch");
       continue;
@@ -891,6 +986,7 @@ Result<void> DecodeFabric::apply_completion(const DecodeExecutionResult& result)
     // reservation, and apply outcome semantics without advancing executor state.
     s.has_inflight = false;
     s.in_flight_dispatch = DispatchId::null();
+    impl_->abort_pending_grant(s);
     impl_->release_reservation(mo.sequence);
     impl_->apply_noncommit_outcome(s, mo);
   }
@@ -932,7 +1028,7 @@ Result<DecodeFabric::AuthorizeResult> DecodeFabric::authorize_prepared(const Pre
 
     // --- Authority validation, most-stale first. ---
     if (pm.epoch != impl_->epoch) {
-      impl_->stale_reconcile(s, pm.sequence);
+      impl_->reconcile_if_current(s, pm.sequence, pm.dispatch);
       impl_->stats.stale_rejections++;
       impl_->record_event(EventKind::StaleRejected, s.req.id, pm.sequence, "stale_epoch");
       ga.rejected = true; ga.aborted = true; ga.error_code = ErrorCode::StaleCoordinatorEpoch; ga.reason = "stale_epoch";
@@ -941,15 +1037,23 @@ Result<DecodeFabric::AuthorizeResult> DecodeFabric::authorize_prepared(const Pre
     }
     auto wit = impl_->worker_current_boot.find(pm.worker);
     if (wit != impl_->worker_current_boot.end() && wit->second != pm.worker_boot) {
-      impl_->stale_reconcile(s, pm.sequence);
+      impl_->reconcile_if_current(s, pm.sequence, pm.dispatch);
       impl_->stats.stale_rejections++;
       impl_->record_event(EventKind::StaleRejected, s.req.id, pm.sequence, "stale_worker_boot");
       ga.rejected = true; ga.aborted = true; ga.error_code = ErrorCode::StaleWorkerBoot; ga.reason = "stale_worker_boot";
       ar.members.push_back(std::move(ga));
       continue;
     }
+    if (s.has_inflight && pm.worker != s.in_flight_worker) {
+      // Only the worker the step was dispatched to can prepare it.
+      impl_->stats.stale_rejections++;
+      impl_->record_event(EventKind::StaleRejected, s.req.id, pm.sequence, "wrong_worker");
+      ga.rejected = true; ga.aborted = true; ga.error_code = ErrorCode::UnknownWorker; ga.reason = "wrong_worker";
+      ar.members.push_back(std::move(ga));
+      continue;
+    }
     if (pm.attempt != s.current_attempt) {
-      impl_->stale_reconcile(s, pm.sequence);
+      impl_->reconcile_if_current(s, pm.sequence, pm.dispatch);
       impl_->stats.stale_rejections++;
       impl_->record_event(EventKind::StaleRejected, s.req.id, pm.sequence, "stale_attempt");
       ga.rejected = true; ga.aborted = true; ga.error_code = ErrorCode::StaleAttempt; ga.reason = "stale_attempt";
@@ -957,15 +1061,16 @@ Result<DecodeFabric::AuthorizeResult> DecodeFabric::authorize_prepared(const Pre
       continue;
     }
     if (pm.generation.value() != s.in_flight_generation) {
-      impl_->stale_reconcile(s, pm.sequence);
+      impl_->reconcile_if_current(s, pm.sequence, pm.dispatch);
       impl_->stats.stale_rejections++;
       impl_->record_event(EventKind::StaleRejected, s.req.id, pm.sequence, "stale_generation");
       ga.rejected = true; ga.aborted = true; ga.error_code = ErrorCode::StaleDecodeGeneration; ga.reason = "stale_generation";
       ar.members.push_back(std::move(ga));
       continue;
     }
-    if (pm.dispatch != s.in_flight_dispatch) {
-      impl_->stale_reconcile(s, pm.sequence);
+    if (!s.has_inflight || pm.dispatch != s.in_flight_dispatch) {
+      // Nothing is in flight for this sequence, or it is in flight under a
+      // different dispatch: either way this result is not the live step's.
       impl_->stats.stale_rejections++;
       impl_->record_event(EventKind::StaleRejected, s.req.id, pm.sequence, "stale_dispatch");
       ga.rejected = true; ga.aborted = true; ga.error_code = ErrorCode::DuplicateCompletion; ga.reason = "stale_dispatch";
@@ -973,7 +1078,7 @@ Result<DecodeFabric::AuthorizeResult> DecodeFabric::authorize_prepared(const Pre
       continue;
     }
     if (is_terminal(s.machine.state())) {
-      impl_->stale_reconcile(s, pm.sequence);
+      impl_->reconcile_if_current(s, pm.sequence, pm.dispatch);
       impl_->stats.stale_rejections++;
       impl_->record_event(EventKind::StaleRejected, s.req.id, pm.sequence, "completion_for_terminal");
       ga.rejected = true; ga.aborted = true; ga.error_code = ErrorCode::CompletionForTerminal; ga.reason = "terminal";
@@ -981,7 +1086,7 @@ Result<DecodeFabric::AuthorizeResult> DecodeFabric::authorize_prepared(const Pre
       continue;
     }
     if (s.machine.state() == SequenceState::CancelRequested || s.machine.state() == SequenceState::Cancelled) {
-      impl_->stale_reconcile(s, pm.sequence);
+      impl_->reconcile_if_current(s, pm.sequence, pm.dispatch);
       impl_->stats.stale_rejections++;
       impl_->record_event(EventKind::StaleRejected, s.req.id, pm.sequence, "completion_for_cancelled");
       ga.rejected = true; ga.aborted = true; ga.error_code = ErrorCode::CompletionForCancelled; ga.reason = "cancelled";
@@ -989,12 +1094,27 @@ Result<DecodeFabric::AuthorizeResult> DecodeFabric::authorize_prepared(const Pre
       continue;
     }
     if (s.machine.state() == SequenceState::DeadlineExpired) {
-      impl_->stale_reconcile(s, pm.sequence);
+      impl_->reconcile_if_current(s, pm.sequence, pm.dispatch);
       impl_->stats.stale_rejections++;
       impl_->record_event(EventKind::StaleRejected, s.req.id, pm.sequence, "completion_for_expired");
       ga.rejected = true; ga.aborted = true; ga.error_code = ErrorCode::CompletionForExpired; ga.reason = "expired";
       ar.members.push_back(std::move(ga));
       continue;
+    }
+    if (s.has_inflight_grant) {
+      auto og = impl_->grant_ledger.find(s.in_flight_grant);
+      if (og != impl_->grant_ledger.end() && og->second.status == 0 && og->second.grant.dispatch == pm.dispatch) {
+        // This dispatch already holds a grant. The outstanding grant settles
+        // the step; a second prepared result for it changes nothing.
+        impl_->stats.stale_rejections++;
+        impl_->record_event(EventKind::StaleRejected, s.req.id, pm.sequence, "duplicate_prepared");
+        ga.rejected = true; ga.aborted = true; ga.error_code = ErrorCode::TransactionConflict;
+        ga.reason = "conflicting pending grant for sequence+generation";
+        ar.members.push_back(std::move(ga));
+        continue;
+      }
+      // A grant left over from a superseded dispatch can no longer be honored.
+      impl_->abort_pending_grant(s);
     }
 
     if (!pm.is_commit_eligible()) {
@@ -1022,15 +1142,6 @@ Result<DecodeFabric::AuthorizeResult> DecodeFabric::authorize_prepared(const Pre
       impl_->record_event(EventKind::StaleRejected, s.req.id, pm.sequence, "already_accepted_replay");
       ga.rejected = true; ga.aborted = true; ga.error_code = ErrorCode::DuplicateCompletion;
       ga.reason = "already-accepted generation reconciled idempotently";
-      ar.members.push_back(std::move(ga));
-      continue;
-    }
-    if (s.has_inflight_grant) {
-      impl_->stale_reconcile(s, pm.sequence);
-      impl_->stats.stale_rejections++;
-
-      ga.rejected = true; ga.aborted = true; ga.error_code = ErrorCode::TransactionConflict;
-      ga.reason = "conflicting pending grant for sequence+generation";
       ar.members.push_back(std::move(ga));
       continue;
     }
@@ -1126,6 +1237,7 @@ Result<void> DecodeFabric::apply_commit_receipt(const ReceiptDecode& receipts) {
     if (!(rec.grant_id == g.grant_id && rec.proposal == g.proposal &&
           rec.sequence == g.sequence && rec.state == g.state &&
           rec.attempt == g.attempt && rec.generation == g.generation &&
+          rec.worker == g.worker &&
           rec.worker_boot == g.worker_boot && rec.epoch == g.epoch &&
           rec.dispatch == g.dispatch &&
           rec.committed_position_before == g.committed_position &&
@@ -1185,7 +1297,7 @@ Result<void> DecodeFabric::apply_commit_receipt(const ReceiptDecode& receipts) {
     if (terminal) {
       s.machine.transition_to(SequenceState::StepCompleted);
       s.machine.transition_to(SequenceState::Completed);
-      impl_->tenant_active[s.req.tenant] = std::max(0u, impl_->tenant_active[s.req.tenant] - 1u);
+      impl_->dec_tenant(s.req.tenant);
       impl_->stats.sequences_completed++;
       impl_->terminal_records[rec.sequence] = SequenceState::Completed;
       impl_->record_event(EventKind::SequenceCompleted, s.req.id, rec.sequence, "terminal");
@@ -1230,8 +1342,9 @@ Result<void> DecodeFabric::abort_prepared(const AbortPrepared& abort) {
     impl_->release_reservation(abort.sequence);
     if (!is_terminal(s.machine.state()) &&
         (s.machine.state() == SequenceState::Dispatched || s.machine.state() == SequenceState::Running)) {
+      // ReadyForNextToken, not Waiting: a Waiting sequence cannot be grouped.
       s.machine.transition_to(SequenceState::StepCompleted);
-      s.machine.transition_to(SequenceState::Waiting);
+      s.machine.transition_to(SequenceState::ReadyForNextToken);
       s.ready_at = impl_->now();
     }
     impl_->record_event(EventKind::StaleRejected, s.req.id, abort.sequence, "aborted_prepared");
@@ -1567,6 +1680,21 @@ Result<std::vector<std::uint8_t>> DecodeFabric::serialize_state() const {
       w.u8(a.terminal ? 1 : 0);
       w.u8(a.promotion_observed ? 1 : 0);
     }
+    // Version 4: what the request needs to run on the same model variant and
+    // device, with the same sampling metadata and state identity, and to be
+    // scheduled the same way after recovery.
+    w.u64(s.req.adapter.value());
+    w.u64(s.req.device_constraint.value());
+    w.str(s.req.sampling_metadata);
+    w.u64(s.state.device.value());
+    w.u64(s.state.access_version);
+    {
+      std::uint64_t twbits = 0;
+      std::memcpy(&twbits, &s.req.tenant_weight, sizeof(twbits));
+      w.u64(twbits);
+    }
+    w.ns(s.req.per_token_target_ns);
+    w.ns(s.req.arrival.ns);
   }
   // terminal records
   std::uint64_t tcount = static_cast<std::uint64_t>(impl_->terminal_records.size());
@@ -1615,7 +1743,9 @@ Result<std::vector<std::uint8_t>> DecodeFabric::serialize_state() const {
 
 Result<void> DecodeFabric::recover_state(const std::vector<std::uint8_t>& bytes) {
   std::unique_lock lk(impl_->mtx);
-  // Verify the trailing 32-bit CRC over the body before mutating anything.
+  // The whole snapshot is read and checked into local state first. The live
+  // state is replaced only when every record is valid, so a refused snapshot
+  // leaves the fabric exactly as it was.
   if (bytes.size() < 5)
     return failed<void>(ErrorCode::PersistenceTruncated, "state too short");
   std::uint32_t expected_crc = static_cast<std::uint32_t>(bytes[bytes.size() - 4]) |
@@ -1626,25 +1756,32 @@ Result<void> DecodeFabric::recover_state(const std::vector<std::uint8_t>& bytes)
   computed = ~computed;
   if (computed != expected_crc)
     return failed<void>(ErrorCode::PersistenceChecksumMismatch, "state checksum mismatch");
-  binary::Reader r(bytes);
+  // The reader covers the body only: the trailing CRC is not record data.
+  binary::Reader r(bytes.data(), bytes.size() - 4);
+  auto corrupt = [](const char* m) { return failed<void>(ErrorCode::PersistenceInvalidField, m); };
   auto m0 = r.u8(); if (!m0.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "missing magic");
   auto m1 = r.u8(); if (!m1.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "missing magic");
   auto m2 = r.u8(); if (!m2.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "missing magic");
   auto m3 = r.u8(); if (!m3.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "missing magic");
   if (m0.value() != 'D' || m1.value() != 'F' || m2.value() != 'S' || m3.value() != 'T')
     return failed<void>(ErrorCode::PersistenceCorrupt, "bad magic");
-  auto ver = r.u32(); if (!ver.ok() || ver.value() != kPersistenceVersion)
+  // Version 3 snapshots are still read; their sequence records lack the
+  // version-4 fields, which keep their defaults.
+  auto ver = r.u32();
+  if (!ver.ok() || (ver.value() != kPersistenceVersion && ver.value() != 3))
     return failed<void>(ErrorCode::PersistenceUnknownVersion, "bad persistence version");
+  const std::uint32_t version = ver.value();
   auto ep = r.u64(); if (!ep.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "epoch");
   auto next_seq = r.u64(); if (!next_seq.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "next_seq");
   auto next_d = r.u64(); if (!next_d.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "next_dispatch");
-  impl_->epoch = CoordinatorEpoch::from(ep.value());
-  impl_->next_seq = next_seq.value();
-  impl_->next_dispatch = next_d.value();
-  impl_->seqs.clear();
-  impl_->req_to_seq.clear();
-  impl_->terminal_records.clear();
-  impl_->tenant_active.clear();
+  if (ep.value() == 0) return corrupt("coordinator epoch is null");
+
+  std::unordered_map<SequenceId, Impl::Seq> seqs;
+  std::unordered_map<RequestId, SequenceId> req_to_seq;
+  std::unordered_map<SequenceId, SequenceState> terminal_records;
+  std::unordered_map<TenantId, std::uint32_t> tenant_active;
+  std::unordered_map<GrantId, Impl::GrantRecord> grant_ledger;
+
   auto cnt = r.u64(); if (!cnt.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "seq count");
   for (std::uint64_t i = 0; i < cnt.value(); ++i) {
     Impl::Seq s;
@@ -1672,8 +1809,12 @@ Result<void> DecodeFabric::recover_state(const std::vector<std::uint8_t>& bytes)
     auto eg = r.u64(); if (!eg.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "est growth");
     auto ot = r.u64(); if (!ot.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "owner tag");
     auto ac = r.u32(); if (!ac.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "attempt count");
+    if (st.value() > static_cast<std::uint8_t>(SequenceState::StaleSuperseded)) return corrupt("sequence state out of range");
+    if (lc.value() > static_cast<std::uint8_t>(LatencyClass::Bulk)) return corrupt("latency class out of range");
+    if (ml.value() == 0 || bg.value() > ml.value()) return corrupt("generation budget out of range");
 
     s.req.id = RequestId::from(rq.value());
+    s.req.sequence = seq;
     s.current_attempt = AttemptId::from(at.value());
     s.req.tenant = TenantId::from(t.value());
     s.req.model = ModelId::from(md.value());
@@ -1684,7 +1825,7 @@ Result<void> DecodeFabric::recover_state(const std::vector<std::uint8_t>& bytes)
     s.req.priority = pr.value();
     s.req.latency_class = static_cast<LatencyClass>(lc.value());
     s.budget = TokenBudget(ml.value());
-    for (std::uint64_t k = 0; k < bg.value(); ++k) s.budget.advance(1);
+    if (bg.value() > 0) (void)s.budget.advance(bg.value());
     s.generation = gen.value();
     s.generated = gen_t.value();
     s.committed = comm.value();
@@ -1730,37 +1871,69 @@ Result<void> DecodeFabric::recover_state(const std::vector<std::uint8_t>& bytes)
       a.pre_state_digest = pre.value(); a.post_state_digest = post.value(); a.delta_digest = dd.value();
       a.terminal = term.value() != 0; a.promotion_observed = po.value() != 0;
     }
+    if (version >= 4) {
+      // What the request needs to run on the same model variant and device,
+      // with the same sampling metadata and state identity, and to be
+      // scheduled the same way.
+      auto adp = r.u64(); if (!adp.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "adapter");
+      auto dvc = r.u64(); if (!dvc.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "device constraint");
+      auto smd = r.str(); if (!smd.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "sampling metadata");
+      auto sdv = r.u64(); if (!sdv.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "state device");
+      auto sav = r.u64(); if (!sav.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "state access version");
+      auto twb = r.u64(); if (!twb.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "tenant weight");
+      auto ptt = r.ns(); if (!ptt.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "per-token target");
+      auto arr = r.ns(); if (!arr.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "arrival");
+      double tw = 0.0;
+      const std::uint64_t twbits = twb.value();
+      std::memcpy(&tw, &twbits, sizeof(tw));
+      if (!(tw > 0.0)) return corrupt("tenant weight must be positive");
+      s.req.adapter = AdapterId::from(adp.value());
+      s.req.device_constraint = DeviceId::from(dvc.value());
+      s.req.sampling_metadata = smd.value();
+      s.state.device = DeviceId::from(sdv.value());
+      s.state.access_version = sav.value();
+      s.req.tenant_weight = tw;
+      s.req.per_token_target_ns = ptt.value();
+      s.req.arrival = TimePoint(arr.value());
+    }
+    s.req.state = s.state;
     // Never restore a stale in-flight authority as current.
     s.has_inflight = false;
     s.in_flight_dispatch = DispatchId::null();
     s.has_inflight_grant = false;
     s.in_flight_grant = GrantId::null();
     s.in_flight_proposal = ProposalId::null();
+    s.reservation = ReservationId::null();
     SequenceState restored = static_cast<SequenceState>(st.value());
     if (restored == SequenceState::Dispatched || restored == SequenceState::Running ||
         restored == SequenceState::Reserved || restored == SequenceState::Grouped ||
-        restored == SequenceState::StepCompleted || restored == SequenceState::Cancelled ||
-        restored == SequenceState::DeadlineExpired) {
-      // Reconcile formerly-running work explicitly: re-queue, clear reservations.
-      s.reservation = ReservationId::null();
-      s.machine = SequenceStateMachine(restored);
-      s.machine.transition_to(SequenceState::Waiting);
+        restored == SequenceState::StepCompleted) {
+      // Reconcile formerly-running work explicitly: it is queued for its next
+      // step again. (Dispatched and Running cannot go to Waiting, and Waiting
+      // cannot be grouped, so the sequence is placed in ReadyForNextToken.)
+      s.machine = SequenceStateMachine(SequenceState::ReadyForNextToken);
     } else {
       s.machine = SequenceStateMachine(restored);
     }
-    impl_->seqs.emplace(seq, std::move(s));
-    impl_->req_to_seq[s.req.id] = seq;
-    impl_->tenant_active[s.req.tenant]++;
+    if (!is_terminal(s.machine.state()) && s.budget.exhausted())
+      return corrupt("unfinished sequence with no generation budget left");
+    const RequestId rid = s.req.id;
+    const TenantId tenant = s.req.tenant;
+    const bool live = !is_terminal(s.machine.state());
+    if (!seqs.emplace(seq, std::move(s)).second) return corrupt("duplicate sequence id");
+    req_to_seq[rid] = seq;
+    if (live) tenant_active[tenant]++;
   }
   auto tcnt = r.u64(); if (!tcnt.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "terminal count");
   for (std::uint64_t i = 0; i < tcnt.value(); ++i) {
     auto tseq = r.u64(); if (!tseq.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "t seq");
     auto tst = r.u8(); if (!tst.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "t state");
-    impl_->terminal_records[SequenceId::from(tseq.value())] = static_cast<SequenceState>(tst.value());
+    if (tst.value() > static_cast<std::uint8_t>(SequenceState::StaleSuperseded) ||
+        !is_terminal(static_cast<SequenceState>(tst.value())))
+      return corrupt("terminal record with a non-terminal state");
+    terminal_records[SequenceId::from(tseq.value())] = static_cast<SequenceState>(tst.value());
   }
   // Grant ledger (transactional protocol) + receipt count.
-  impl_->grant_ledger.clear();
-  impl_->receipt_count = 0;
   auto gcnt = r.u64(); if (!gcnt.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "grant count");
   if (gcnt.value() > (1ull << 22)) return failed<void>(ErrorCode::PersistenceInvalidField, "grant count too large");
   for (std::uint64_t i = 0; i < gcnt.value(); ++i) {
@@ -1785,6 +1958,8 @@ Result<void> DecodeFabric::recover_state(const std::vector<std::uint8_t>& bytes)
     auto an = r.ns(); if (!an.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "grant active");
     auto status = r.u32(); if (!status.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "grant status");
     auto has_rec = r.u8(); if (!has_rec.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "grant has receipt");
+    if (status.value() > 2) return corrupt("grant status out of range");
+    if (ok.value() > static_cast<std::uint8_t>(MemberOutcomeKind::StaleAuthorityRejected)) return corrupt("grant outcome out of range");
     gr.grant.grant_id = GrantId::from(gid.value()); gr.grant.proposal = ProposalId::from(pro.value());
     gr.grant.epoch = CoordinatorEpoch::from(g_ep.value()); gr.grant.worker = WorkerId::from(wk.value());
     gr.grant.worker_boot = WorkerBootId::from(wb.value()); gr.grant.sequence = SequenceId::from(sq.value());
@@ -1811,7 +1986,7 @@ Result<void> DecodeFabric::recover_state(const std::vector<std::uint8_t>& bytes)
       auto rk = r.u64(); if (!rk.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "receipt dispatch");
       auto la = r.u64(); if (!la.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "receipt cb");
       auto lb = r.u64(); if (!lb.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "receipt ca");
-      auto lc = r.u64(); if (!lc.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "receipt pre");
+      auto lc2 = r.u64(); if (!lc2.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "receipt pre");
       auto ld = r.u64(); if (!ld.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "receipt post");
       auto le = r.u64(); if (!le.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "receipt delta");
       auto lf = r.u8(); if (!lf.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "receipt kind");
@@ -1819,6 +1994,7 @@ Result<void> DecodeFabric::recover_state(const std::vector<std::uint8_t>& bytes)
       auto lh = r.u32(); if (!lh.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "receipt token");
       auto li = r.ns(); if (!li.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "receipt active");
       auto lj = r.ns(); if (!lj.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "receipt time");
+      if (lf.value() > static_cast<std::uint8_t>(MemberOutcomeKind::StaleAuthorityRejected)) return corrupt("receipt outcome out of range");
       rp.receipt_id = ReceiptId::from(ra.value()); rp.grant_id = GrantId::from(rb.value());
       rp.proposal = ProposalId::from(rc.value()); rp.epoch = CoordinatorEpoch::from(rd.value());
       rp.worker = WorkerId::from(re.value()); rp.worker_boot = WorkerBootId::from(rf.value());
@@ -1826,16 +2002,36 @@ Result<void> DecodeFabric::recover_state(const std::vector<std::uint8_t>& bytes)
       rp.attempt = AttemptId::from(ri.value()); rp.generation = DecodeGeneration::from(rj.value());
       rp.dispatch = DispatchId::from(rk.value());
       rp.committed_position_before = la.value(); rp.committed_position_after = lb.value();
-      rp.pre_state_digest = lc.value(); rp.post_state_digest = ld.value(); rp.delta_digest = le.value();
+      rp.pre_state_digest = lc2.value(); rp.post_state_digest = ld.value(); rp.delta_digest = le.value();
       rp.outcome_kind = static_cast<MemberOutcomeKind>(lf.value()); rp.terminal = lg.value() != 0;
       rp.token_identifier = lh.value(); rp.active_ns = li.value(); rp.committed_at = TimePoint(lj.value());
       gr.receipt = std::move(rp);
       gr.has_receipt = true;
     }
-    impl_->grant_ledger[gr.grant.grant_id] = std::move(gr);
+    grant_ledger[gr.grant.grant_id] = std::move(gr);
   }
   auto rcnt = r.u64(); if (!rcnt.ok()) return failed<void>(ErrorCode::PersistenceTruncated, "receipt count");
+  if (r.remaining() != 0) return corrupt("trailing bytes in state");
+
+  // ---- Every record is valid: replace the live state. ----
+  impl_->epoch = CoordinatorEpoch::from(ep.value());
+  impl_->next_seq = next_seq.value();
+  impl_->next_dispatch = next_d.value();
+  impl_->seqs = std::move(seqs);
+  impl_->req_to_seq = std::move(req_to_seq);
+  impl_->terminal_records = std::move(terminal_records);
+  impl_->tenant_active = std::move(tenant_active);
+  impl_->grant_ledger = std::move(grant_ledger);
   impl_->receipt_count = rcnt.value();
+  // Nothing restored is in flight, so the reservations and worker capacity
+  // that live work held are given back.
+  impl_->reservations.clear();
+  impl_->reservation_holders.clear();
+  for (auto& kv : impl_->dev_mem) kv.second.reserved = 0;
+  for (auto& kv : impl_->workers) kv.second.active_reservations = 0;
+  // Grant ids handed out after recovery never repeat a restored one.
+  for (const auto& kv : impl_->grant_ledger)
+    if (kv.first.value() >= impl_->next_grant) impl_->next_grant = kv.first.value() + 1;
   // Recompute derived/total counters from the restored sequences (the raw
   // aggregate counters are derived, never trusted from the wire).
   impl_->stats.generated_tokens = 0;

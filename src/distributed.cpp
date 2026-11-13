@@ -5,6 +5,7 @@
 #include "decodefabric/messages.hpp"
 #include "decodefabric/protocol.hpp"
 #include "decodefabric/transport.hpp"
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -119,7 +120,7 @@ std::map<WorkerId, std::shared_ptr<TcpConnection>> g_worker_conns;
 // ===========================================================================
 // Coordinator
 // ===========================================================================
-Result<void> run_coordinator(DecodeFabric& fab, int listen_port, int max_loops, bool& running) {
+Result<void> run_coordinator(DecodeFabric& fab, int listen_port, int max_loops, std::atomic<bool>& running) {
   TcpListener listener;
   auto lr = listener.listen("127.0.0.1", listen_port);
   if (!lr.ok()) return failed<void>(ErrorCode::BackendError, "coordinator bind failed: " + lr.error().message);
@@ -144,24 +145,42 @@ Result<void> run_coordinator(DecodeFabric& fab, int listen_port, int max_loops, 
           auto wd = dec_worker(fr.payload);
           if (!wd.ok()) return;
           WorkerDescriptor w = wd.value();
-          (void)fab.register_worker(w);
           {
+            // The connection is published before the worker becomes eligible
+            // for dispatch, so no dispatch is issued to a worker the scheduler
+            // cannot reach (such a dispatch was dropped and never re-queued).
             std::lock_guard<std::mutex> lk(g_worker_mu);
             g_worker_conns[w.id] = sp;
+          }
+          if (!fab.register_worker(w).ok()) {
+            std::lock_guard<std::mutex> lk(g_worker_mu);
+            auto it = g_worker_conns.find(w.id);
+            if (it != g_worker_conns.end() && it->second == sp) g_worker_conns.erase(it);
+            return;
           }
           // Worker I/O loop: read PreparedResult / CommitReceipt, detect death.
           while (running) {
             auto next = sp->recv_frame();
             if (!next.ok()) {
-              (void)fab.mark_worker_dead(w.id);
+              // Only the connection that currently stands for the worker reports
+              // it dead. One that a restarted worker has replaced must not mark
+              // the new process dead or drop its connection. The registry lock
+              // is held across the check and the marking so a re-registration
+              // cannot slip in between.
               std::lock_guard<std::mutex> lk(g_worker_mu);
-              g_worker_conns.erase(w.id);
+              auto it = g_worker_conns.find(w.id);
+              if (it != g_worker_conns.end() && it->second == sp) {
+                (void)fab.mark_worker_dead(w.id);
+                g_worker_conns.erase(it);
+              }
               break;
             }
             Frame f = next.value();
             if (f.type == FrameType::PreparedResult) {
               auto res = decode_prepared_result(f.payload);
-              if (res.ok()) {
+              // A worker answers only for itself: a result naming another worker
+              // or boot would have that worker's commit grant sent to this one.
+              if (res.ok() && res.value().worker == w.id && res.value().worker_boot == w.boot_id) {
                 auto auth = fab.authorize_prepared(res.value());
                 if (auth.ok()) {
                   // Send a one-use commit grant (or an abort) back to the worker
@@ -174,7 +193,8 @@ Result<void> run_coordinator(DecodeFabric& fab, int listen_port, int max_loops, 
               }
             } else if (f.type == FrameType::CommitReceipt) {
               auto rc = decode_commit_receipts(f.payload);
-              if (rc.ok()) (void)fab.apply_commit_receipt(rc.value());
+              if (rc.ok() && rc.value().worker == w.id && rc.value().worker_boot == w.boot_id)
+                (void)fab.apply_commit_receipt(rc.value());
             } else if (f.type == FrameType::Shutdown) {
               std::lock_guard<std::mutex> lk(g_worker_mu);
               g_worker_conns.erase(w.id);
@@ -276,8 +296,12 @@ Result<void> run_coordinator(DecodeFabric& fab, int listen_port, int max_loops, 
 
   // Schedule/dispatch thread.
   std::thread schedule_thread([&fab, &running]() {
+    // Deadlines and scheduling ages are measured on the fabric's monotonic
+    // timeline (the coordinator's fabric uses the default MonotonicClock).
+    // Scheduling at time 0 never expired a deadline.
+    MonotonicClock clk;
     while (running) {
-      auto ds = fab.schedule(TimePoint(0));
+      auto ds = fab.schedule(clk.now());
       for (const Dispatch& d : ds) {
         std::shared_ptr<TcpConnection> conn;
         { std::lock_guard<std::mutex> lk(g_worker_mu); auto it = g_worker_conns.find(d.worker); if (it != g_worker_conns.end()) conn = it->second; }
@@ -295,11 +319,17 @@ Result<void> run_coordinator(DecodeFabric& fab, int listen_port, int max_loops, 
   // Run until stopped or max_loops.
   long loops = 0;
   while (running) {
-    if (max_loops > 0 && loops >= max_loops) { running = false; break; }
+    if (max_loops >= 0 && loops >= max_loops) { running = false; break; }
     ++loops;
     std::this_thread::sleep_for(std::chrono::milliseconds(2));
   }
   running = false;
+  {
+    // The accept thread is blocked in accept(); a connection wakes it so it
+    // sees the stop and returns instead of blocking the join forever.
+    TcpConnection waker;
+    (void)waker.connect("127.0.0.1", listen_port);
+  }
   if (accept_thread.joinable()) accept_thread.join();
   if (schedule_thread.joinable()) schedule_thread.join();
   return Result<void>::success();
@@ -309,7 +339,9 @@ int coordinator_main(int argc, char** argv) {
   if (argc < 2) { std::fprintf(stderr, "usage: df-coordinator <port> [loops]\n"); return 2; }
   int port = std::atoi(argv[1]);
   int loops = argc >= 3 ? std::atoi(argv[2]) : -1;
-  bool running = loops < 0;  // if loops provided, run that many then stop
+  // Runs until stopped, or for `loops` iterations when a count is given
+  // (starting it stopped made a loop count exit at once).
+  std::atomic<bool> running{true};
   DecodeFabric::Config cfg;
   cfg.group_limits.max_sequences = 64;
   DecodeFabric fab(cfg);

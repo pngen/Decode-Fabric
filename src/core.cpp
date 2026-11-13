@@ -239,6 +239,12 @@ Result<void> DecodeRequest::validate() const {
     return Result<void>{Error{ErrorCode::InvalidArgument,
                               "pregenerated exceeds maximum generation length"}};
   }
+  // A request whose budget is already used up has no decode step left. It
+  // could never be scheduled, and no step boundary would ever complete it.
+  if (pregenerated == max_generation_length) {
+    return Result<void>{Error{ErrorCode::InvalidArgument,
+                              "pregenerated tokens leave nothing to generate"}};
+  }
   if (!(tenant_weight > 0.0)) {
     return Result<void>{Error{ErrorCode::InvalidArgument,
                               "tenant weight must be positive"}};
